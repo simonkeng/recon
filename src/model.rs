@@ -14,9 +14,12 @@ pub fn display_name(model_id: &str) -> &str {
 /// Context window size for a given model ID.
 pub fn context_window(model_id: &str) -> u64 {
     match model_id {
-        "claude-opus-4-6" | "claude-sonnet-4-6" => 200_000,
-        "claude-sonnet-4-5-20250514" | "claude-haiku-4-5-20251001" => 200_000,
-        "claude-opus-4-20250514" | "claude-sonnet-4-20250514" => 200_000,
+        "claude-opus-4-6" => 1_000_000,
+        "claude-sonnet-4-6" => 200_000,
+        "claude-sonnet-4-5-20250514" => 200_000,
+        "claude-haiku-4-5-20251001" => 200_000,
+        "claude-opus-4-20250514" => 200_000,
+        "claude-sonnet-4-20250514" => 200_000,
         _ => 200_000,
     }
 }
