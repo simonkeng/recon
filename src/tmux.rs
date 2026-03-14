@@ -53,6 +53,12 @@ pub fn create_session(name: &str, cwd: &str) -> Result<String, String> {
         return Err("tmux new-session failed".to_string());
     }
 
+    // Keep the window alive after claude exits so the user can read the
+    // "Resume this session with: claude --resume <id>" message.
+    let _ = Command::new("tmux")
+        .args(["set-window-option", "-t", &session_name, "remain-on-exit", "on"])
+        .status();
+
     Ok(session_name)
 }
 
@@ -106,6 +112,10 @@ pub fn resume_session(session_id: &str, name: Option<&str>) -> Result<String, St
     if !status.success() {
         return Err("tmux new-session failed".to_string());
     }
+
+    let _ = Command::new("tmux")
+        .args(["set-window-option", "-t", &session_name, "remain-on-exit", "on"])
+        .status();
 
     Ok(session_name)
 }
