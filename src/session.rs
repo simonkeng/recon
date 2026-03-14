@@ -280,23 +280,49 @@ struct ParsedInfo {
 }
 
 use std::sync::Mutex;
+use std::time::Instant;
 
-/// Get the git project name and branch for a directory.
-fn git_project_info(cwd: &str) -> (String, Option<String>) {
-    (git_repo_name(cwd), git_branch(cwd))
+struct GitInfo {
+    repo_name: String,
+    branch: Option<String>,
+    fetched_at: Instant,
 }
 
-static GIT_REPO_CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+static GIT_CACHE: Mutex<Option<HashMap<String, GitInfo>>> = Mutex::new(None);
 
-fn git_repo_name(cwd: &str) -> String {
+const GIT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Get the git project name and branch for a directory (cached for 30s).
+fn git_project_info(cwd: &str) -> (String, Option<String>) {
     {
-        let cache = GIT_REPO_CACHE.lock().unwrap();
-        if let Some(name) = cache.as_ref().and_then(|c| c.get(cwd)) {
-            return name.clone();
+        let cache = GIT_CACHE.lock().unwrap();
+        if let Some(info) = cache.as_ref().and_then(|c| c.get(cwd)) {
+            if info.fetched_at.elapsed() < GIT_CACHE_TTL {
+                return (info.repo_name.clone(), info.branch.clone());
+            }
         }
     }
 
-    let name = match std::process::Command::new("git")
+    let repo_name = fetch_git_repo_name(cwd);
+    let branch = fetch_git_branch(cwd);
+
+    let mut cache = GIT_CACHE.lock().unwrap();
+    if cache.is_none() {
+        *cache = Some(HashMap::new());
+    }
+    cache.as_mut().unwrap().insert(
+        cwd.to_string(),
+        GitInfo {
+            repo_name: repo_name.clone(),
+            branch: branch.clone(),
+            fetched_at: Instant::now(),
+        },
+    );
+    (repo_name, branch)
+}
+
+fn fetch_git_repo_name(cwd: &str) -> String {
+    match std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--show-toplevel"])
         .output()
     {
@@ -311,17 +337,10 @@ fn git_repo_name(cwd: &str) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| cwd.to_string()),
-    };
-
-    let mut cache = GIT_REPO_CACHE.lock().unwrap();
-    if cache.is_none() {
-        *cache = Some(HashMap::new());
     }
-    cache.as_mut().unwrap().insert(cwd.to_string(), name.clone());
-    name
 }
 
-fn git_branch(cwd: &str) -> Option<String> {
+fn fetch_git_branch(cwd: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
