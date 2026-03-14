@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::process;
 use crate::session::{self, Session};
 use crate::tmux;
 
@@ -27,15 +26,17 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
-        let procs = process::discover_claude_processes();
-        let sessions = session::resolve_sessions(&procs, &self.prev_sessions);
+        let sessions: Vec<Session> = session::discover_sessions(&self.prev_sessions)
+            .into_iter()
+            .filter(|s| s.tmux_session.is_some())
+            .collect();
 
         self.prev_sessions = sessions
             .iter()
             .map(|s| (s.session_id.clone(), s.clone()))
             .collect();
 
-        self.sessions = sessions.into_iter().filter(|s| s.tmux_session.is_some()).collect();
+        self.sessions = sessions;
 
         if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
             self.selected = self.sessions.len() - 1;
@@ -80,6 +81,7 @@ impl App {
                     "index": i + 1,
                     "session_id": s.session_id,
                     "project_name": s.project_name,
+                    "cwd": s.cwd,
                     "tmux_session": s.tmux_session,
                     "model": s.model,
                     "model_display": s.model_display(&self.effort_level),
@@ -89,7 +91,6 @@ impl App {
                     "token_ratio": s.token_ratio(),
                     "status": s.status.label(),
                     "pid": s.pid,
-                    "tty": s.tty,
                     "last_activity": s.last_activity,
                 })
             })

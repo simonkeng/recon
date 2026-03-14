@@ -1,6 +1,5 @@
 mod app;
 mod model;
-mod process;
 mod session;
 mod tmux;
 mod ui;

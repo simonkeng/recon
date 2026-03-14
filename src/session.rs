@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
 use crate::model;
-use crate::process::ClaudeProcess;
+use crate::tmux;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
@@ -26,19 +27,18 @@ impl SessionStatus {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Session {
     pub session_id: String,
     pub project_name: String,
+    pub cwd: String,
     pub tmux_session: Option<String>,
     pub model: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub status: SessionStatus,
-    pub pid: i32,
-    pub tty: String,
+    pub pid: Option<i32>,
     pub last_activity: Option<String>,
-    pub jsonl_path: Option<PathBuf>,
+    pub jsonl_path: PathBuf,
     pub last_file_size: u64,
 }
 
@@ -74,76 +74,126 @@ impl Session {
     }
 }
 
-/// Resolve sessions from discovered processes.
-pub fn resolve_sessions(
-    processes: &[ClaudeProcess],
-    prev_sessions: &HashMap<String, Session>,
-) -> Vec<Session> {
+/// Discover sessions by scanning JSONL files, then matching to live processes and tmux.
+pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Session> {
     let claude_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),
         None => return vec![],
     };
 
-    let mut sessions = Vec::new();
-
-    for proc in processes {
-        let cwd = match &proc.cwd {
-            Some(c) => c.clone(),
-            None => continue,
-        };
-
-        let encoded = encode_project_path(&cwd);
-        let project_dir = claude_dir.join(&encoded);
-        let project_name = shorten_path(&cwd);
-
-        // Find the JSONL file
-        let jsonl_path = find_jsonl(&project_dir, proc.session_id.as_deref());
-
-        // Determine session_id
-        let session_id = proc
-            .session_id
-            .clone()
-            .or_else(|| {
-                jsonl_path.as_ref().and_then(|p| {
-                    p.file_stem().map(|s| s.to_string_lossy().to_string())
-                })
-            })
-            .unwrap_or_else(|| format!("pid-{}", proc.pid));
-
-        // Check if we have a previous session to do incremental parsing
-        let prev = prev_sessions.get(&session_id);
-        let prev_file_size = prev.map(|s| s.last_file_size).unwrap_or(0);
-        let prev_input = prev.map(|s| s.total_input_tokens).unwrap_or(0);
-        let prev_output = prev.map(|s| s.total_output_tokens).unwrap_or(0);
-        let prev_model = prev.and_then(|s| s.model.clone());
-
-        // Parse JSONL
-        let (input_tokens, output_tokens, model_id, last_activity, file_size) =
-            match &jsonl_path {
-                Some(path) => parse_jsonl(path, prev_file_size, prev_input, prev_output, prev_model),
-                None => (0, 0, None, None, 0),
-            };
-
-        // Determine status from ps stat
-        let status = determine_status(&proc.stat, &jsonl_path, file_size);
-
-        sessions.push(Session {
-            session_id,
-            project_name,
-            tmux_session: proc.tmux_session.clone(),
-            model: model_id,
-            total_input_tokens: input_tokens,
-            total_output_tokens: output_tokens,
-            status,
-            pid: proc.pid,
-            tty: proc.tty.clone(),
-            last_activity,
-            jsonl_path,
-            last_file_size: file_size,
-        });
+    if !claude_dir.exists() {
+        return vec![];
     }
 
+    // Get live claude processes and tmux mapping
+    let live_procs = discover_live_claude_procs();
+    let tty_map = tmux::tty_to_session_map();
+
+    let mut sessions = Vec::new();
+    let cutoff = SystemTime::now() - Duration::from_secs(24 * 3600);
+
+    // Scan all project directories
+    let entries = match fs::read_dir(&claude_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        // Find recently modified JSONL files in this project dir
+        let jsonl_files = match fs::read_dir(&project_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for jentry in jsonl_files.flatten() {
+            let path = jentry.path();
+            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                let modified = path
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+
+                if modified < cutoff {
+                    continue;
+                }
+
+                let session_id = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                // Check if we have a previous session for incremental parsing
+                let prev = prev_sessions.get(&session_id);
+                let prev_file_size = prev.map(|s| s.last_file_size).unwrap_or(0);
+                let prev_input = prev.map(|s| s.total_input_tokens).unwrap_or(0);
+                let prev_output = prev.map(|s| s.total_output_tokens).unwrap_or(0);
+                let prev_model = prev.and_then(|s| s.model.clone());
+
+                // Parse the JSONL
+                let info = parse_jsonl(
+                    &path,
+                    prev_file_size,
+                    prev_input,
+                    prev_output,
+                    prev_model,
+                );
+
+                let cwd = info
+                    .cwd
+                    .unwrap_or_else(|| decode_project_path(&project_dir));
+                let project_name = shorten_path(&cwd);
+
+                // Match to a live process
+                let proc = find_matching_process(&live_procs, &session_id, &cwd);
+
+                // Only show sessions with a live process
+                let pid = match proc {
+                    Some(p) => Some(p.pid),
+                    None => continue,
+                };
+
+                // Map to tmux session via TTY
+                let tmux_session = proc
+                    .and_then(|p| tty_map.get(&p.tty).cloned());
+
+                sessions.push(Session {
+                    session_id,
+                    project_name,
+                    cwd,
+                    tmux_session,
+                    model: info.model,
+                    total_input_tokens: info.input_tokens,
+                    total_output_tokens: info.output_tokens,
+                    status: info.status,
+                    pid,
+                    last_activity: info.last_activity,
+                    jsonl_path: path,
+                    last_file_size: info.file_size,
+                });
+            }
+        }
+    }
+
+    // Sort by project name for stable ordering
+    sessions.sort_by(|a, b| a.project_name.cmp(&b.project_name));
     sessions
+}
+
+#[derive(Debug)]
+struct ParsedInfo {
+    input_tokens: u64,
+    output_tokens: u64,
+    model: Option<String>,
+    cwd: Option<String>,
+    last_activity: Option<String>,
+    status: SessionStatus,
+    file_size: u64,
 }
 
 /// Shorten a path by replacing the home directory with ~.
@@ -157,43 +207,24 @@ fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
-/// Encode a CWD path the same way Claude does for project directories.
-/// `/Users/gavra/repos/yaba` -> `-Users-gavra-repos-yaba`
-fn encode_project_path(path: &str) -> String {
-    path.replace('/', "-").replace('.', "-").replace('_', "-")
-}
+/// Decode an encoded project directory name back to a path.
+/// `-Users-gavra-repos-yaba` -> `/Users/gavra/repos/yaba`
+/// This is a best-effort reverse of the encoding (ambiguous for `.` and `_`).
+fn decode_project_path(project_dir: &Path) -> String {
+    let name = project_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
 
-/// Find the best matching JSONL file in a project directory.
-fn find_jsonl(project_dir: &Path, session_id: Option<&str>) -> Option<PathBuf> {
-    if !project_dir.exists() {
-        return None;
+    // The encoded name replaces / with -, so the first char is always -
+    // Convert back: leading - becomes /, internal - becomes /
+    // This is lossy (can't distinguish original - from / or . or _) but good enough
+    if name.starts_with('-') {
+        name.replacen('-', "/", 1)
+            .replace('-', "/")
+    } else {
+        name
     }
-
-    if let Some(id) = session_id {
-        let direct = project_dir.join(format!("{id}.jsonl"));
-        if direct.exists() {
-            return Some(direct);
-        }
-    }
-
-    // Otherwise find the most recently modified JSONL
-    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    if let Ok(entries) = fs::read_dir(project_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                if let Ok(meta) = path.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if best.as_ref().map(|(_, t)| modified > *t).unwrap_or(true) {
-                            best = Some((path, modified));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    best.map(|(p, _)| p)
 }
 
 /// Minimal serde structs for JSONL parsing.
@@ -207,6 +238,10 @@ struct JsonlEntry {
     message: Option<MessageEntry>,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -236,16 +271,34 @@ fn parse_jsonl(
     prev_input: u64,
     prev_output: u64,
     prev_model: Option<String>,
-) -> (u64, u64, Option<String>, Option<String>, u64) {
+) -> ParsedInfo {
     let file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (prev_input, prev_output, prev_model, None, 0),
+        Err(_) => {
+            return ParsedInfo {
+                input_tokens: prev_input,
+                output_tokens: prev_output,
+                model: prev_model,
+                cwd: None,
+                last_activity: None,
+                status: SessionStatus::Idle,
+                file_size: 0,
+            }
+        }
     };
 
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
 
     if file_size == prev_file_size && prev_file_size > 0 {
-        return (prev_input, prev_output, prev_model, None, file_size);
+        return ParsedInfo {
+            input_tokens: prev_input,
+            output_tokens: prev_output,
+            model: prev_model,
+            cwd: None,
+            last_activity: None,
+            status: determine_status_from_file(path),
+            file_size,
+        };
     }
 
     let mut reader = BufReader::new(file);
@@ -253,6 +306,7 @@ fn parse_jsonl(
     let mut total_output = prev_output;
     let mut model = prev_model;
     let mut last_activity = None;
+    let mut cwd = None;
 
     if prev_file_size > 0 {
         let _ = reader.seek(SeekFrom::Start(prev_file_size));
@@ -281,13 +335,14 @@ fn parse_jsonl(
                 if let Some(ts) = entry.timestamp {
                     last_activity = Some(ts);
                 }
+                if entry.cwd.is_some() {
+                    cwd = entry.cwd;
+                }
                 if let Some(msg) = entry.message {
                     if let Some(m) = msg.model {
                         model = Some(m);
                     }
                     if let Some(usage) = msg.usage {
-                        // Each assistant entry reports total usage for that API call,
-                        // not incremental. Use the latest values, don't sum.
                         total_input = usage.input_tokens
                             + usage.cache_creation_input_tokens
                             + usage.cache_read_input_tokens;
@@ -300,53 +355,190 @@ fn parse_jsonl(
                 if let Some(ts) = entry.timestamp {
                     last_activity = Some(ts);
                 }
+                if entry.cwd.is_some() {
+                    cwd = entry.cwd;
+                }
             }
         }
     }
 
-    (total_input, total_output, model, last_activity, file_size)
+    // Get status from the last entry in the file
+    let status = determine_status_from_file(path);
+
+    ParsedInfo {
+        input_tokens: total_input,
+        output_tokens: total_output,
+        model,
+        cwd,
+        last_activity,
+        status,
+        file_size,
+    }
 }
 
-/// Determine session status from process state and JSONL.
-fn determine_status(stat: &str, jsonl_path: &Option<PathBuf>, _file_size: u64) -> SessionStatus {
-    if let Some(path) = jsonl_path {
-        if let Some(last_type) = read_last_entry_type(path) {
-            return match last_type.as_str() {
-                // turn_duration means claude finished its turn, waiting for user
-                "turn_duration" => SessionStatus::Input,
-                // user message sent, or assistant still streaming — claude is working
-                "user" | "assistant" => SessionStatus::Working,
-                _ => {
-                    // Fall back to process state
-                    if stat.contains('R') { SessionStatus::Working } else { SessionStatus::Idle }
-                }
-            };
-        }
+/// Determine session status from the last JSONL entry.
+fn determine_status_from_file(path: &Path) -> SessionStatus {
+    // Read last ~4KB to find the last meaningful entry
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return SessionStatus::Idle,
+    };
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_size == 0 {
+        return SessionStatus::Idle;
     }
 
-    // No JSONL or empty — use process state
-    if stat.contains('R') { SessionStatus::Working } else { SessionStatus::Idle }
-}
+    let mut reader = BufReader::new(file);
+    let start = if file_size > 4096 { file_size - 4096 } else { 0 };
+    let _ = reader.seek(SeekFrom::Start(start));
 
-/// Read the last meaningful entry type from JSONL (reads from end).
-fn read_last_entry_type(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    for line in content.lines().rev() {
+    let mut buf = String::new();
+    let _ = reader.read_to_string(&mut buf);
+
+    for line in buf.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         if trimmed.contains("\"subtype\":\"turn_duration\"") {
-            return Some("turn_duration".to_string());
+            return SessionStatus::Input;
         }
-        if trimmed.contains("\"type\":\"user\"") {
-            return Some("user".to_string());
-        }
-        if trimmed.contains("\"type\":\"assistant\"") {
-            return Some("assistant".to_string());
+        if trimmed.contains("\"type\":\"user\"") || trimmed.contains("\"type\":\"assistant\"") {
+            return SessionStatus::Working;
         }
         if trimmed.contains("\"type\":\"system\"") {
-            return Some("system".to_string());
+            return SessionStatus::Idle;
+        }
+    }
+
+    SessionStatus::Idle
+}
+
+// --- Live process discovery (minimal, just for liveness check) ---
+
+#[derive(Debug)]
+struct LiveProcess {
+    pid: i32,
+    tty: String,
+    session_id: Option<String>,
+    cwd: Option<String>,
+}
+
+fn discover_live_claude_procs() -> Vec<LiveProcess> {
+    let output = match std::process::Command::new("ps")
+        .args(["-eo", "pid,tty,args"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut procs = Vec::new();
+
+    for line in stdout.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let args_joined = parts[2..].join(" ");
+        if !is_claude_binary(&args_joined) {
+            continue;
+        }
+
+        let pid: i32 = match parts[0].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let tty = parts[1].to_string();
+        let session_id = extract_session_id(&args_joined);
+        let cwd = get_process_cwd(pid);
+
+        procs.push(LiveProcess {
+            pid,
+            tty,
+            session_id,
+            cwd,
+        });
+    }
+
+    procs
+}
+
+fn find_matching_process<'a>(
+    procs: &'a [LiveProcess],
+    session_id: &str,
+    cwd: &str,
+) -> Option<&'a LiveProcess> {
+    // First try matching by session_id in args
+    if let Some(p) = procs.iter().find(|p| {
+        p.session_id
+            .as_ref()
+            .map(|id| id == session_id)
+            .unwrap_or(false)
+    }) {
+        return Some(p);
+    }
+
+    // Fall back to matching by CWD
+    procs.iter().find(|p| {
+        p.cwd
+            .as_ref()
+            .map(|c| c == cwd)
+            .unwrap_or(false)
+    })
+}
+
+fn is_claude_binary(args: &str) -> bool {
+    if args.contains("node_modules/.bin/claude") {
+        return true;
+    }
+    let first_arg = args.split_whitespace().next().unwrap_or("");
+    if first_arg.ends_with("/claude") || first_arg == "claude" {
+        return !first_arg.contains("claude-");
+    }
+    false
+}
+
+fn extract_session_id(args: &str) -> Option<String> {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    for i in 0..parts.len().saturating_sub(1) {
+        if parts[i] == "--resume" || parts[i] == "-r" {
+            return Some(parts[i + 1].to_string());
+        }
+    }
+    None
+}
+
+use std::sync::Mutex;
+
+static CWD_CACHE: Mutex<Option<HashMap<i32, String>>> = Mutex::new(None);
+
+fn get_process_cwd(pid: i32) -> Option<String> {
+    {
+        let cache = CWD_CACHE.lock().unwrap();
+        if let Some(cwd) = cache.as_ref().and_then(|c| c.get(&pid)) {
+            return Some(cwd.clone());
+        }
+    }
+
+    let output = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            if path.starts_with('/') {
+                let mut cache = CWD_CACHE.lock().unwrap();
+                if cache.is_none() {
+                    *cache = Some(HashMap::new());
+                }
+                cache.as_mut().unwrap().insert(pid, path.to_string());
+                return Some(path.to_string());
+            }
         }
     }
     None
