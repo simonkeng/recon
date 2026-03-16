@@ -793,6 +793,9 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
+    let sessions_dir = dirs::home_dir()
+        .map(|h| h.join(".claude").join("sessions"))
+        .unwrap_or_default();
 
     for line in stdout.lines() {
         let parts: Vec<&str> = line.splitn(4, '\t').collect();
@@ -817,10 +820,18 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
             || command == "node";
 
         if is_claude {
-            results.push((pid, session_name.to_string(), pane_path.to_string()));
+            // pane_pid is the initial process — it may be claude itself (recon launch)
+            // or a shell with claude as the foreground child (manual `claude` in a terminal).
+            // Try the pane PID first, fall back to searching children.
+            let claude_pid = if sessions_dir.join(format!("{pid}.json")).exists() {
+                Some(pid)
+            } else {
+                find_claude_child_pid(pid)
+            };
+            if let Some(cpid) = claude_pid {
+                results.push((cpid, session_name.to_string(), pane_path.to_string()));
+            }
         } else if command == "bash" || command == "sh" || command == "zsh" {
-            // The pane may be running a wrapper script with claude as a child.
-            // Check if any child process has a session file.
             if let Some(claude_pid) = find_claude_child_pid(pid) {
                 results.push((claude_pid, session_name.to_string(), pane_path.to_string()));
             }
