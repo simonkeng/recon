@@ -4,6 +4,8 @@ A tmux-native dashboard for managing [Claude Code](https://claude.ai/claude-code
 
 Run multiple Claude Code sessions in tmux, then manage them all without ever leaving the terminal — see what each agent is working on, which ones need your attention, switch between them, kill or spawn new ones, and resume past sessions. All from a single keybinding.
 
+![recon demo](assets/demo.gif)
+
 ## Views
 
 ### Tamagotchi View (`recon view` or press `v`)
