@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
+use crate::io_util::{read_line_capped, MAX_LINE_LEN};
+
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -307,7 +309,7 @@ struct JsonlSummary {
 /// Uses a buffered reader and reads only the last portion of the file to avoid
 /// loading potentially large JSONL files entirely into memory.
 fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::io::{BufReader, Seek, SeekFrom};
 
     let file = match fs::File::open(path) {
         Ok(f) => f,
@@ -322,24 +324,24 @@ fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
     let mut reader = BufReader::new(file);
     let seek_pos = file_len.saturating_sub(TAIL_SIZE);
     if seek_pos > 0 {
-        let _ = reader.seek(SeekFrom::Start(seek_pos));
+        if reader.seek(SeekFrom::Start(seek_pos)).is_err() {
+            return JsonlSummary { model: None, branch: None, tokens: 0 };
+        }
         // Discard partial first line after seeking
         let mut discard = String::new();
-        let _ = reader.read_line(&mut discard);
+        let _ = read_line_capped(&mut reader, &mut discard, MAX_LINE_LEN);
     }
 
     // Collect the tail lines so we can iterate in reverse
-    const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
     let mut tail_lines: Vec<String> = Vec::new();
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
         }
-        if line.len() <= MAX_LINE_LEN {
+        if !line.is_empty() {
             tail_lines.push(line.clone());
         }
     }

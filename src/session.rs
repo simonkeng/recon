@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
+use crate::io_util::{read_line_capped, MAX_LINE_LEN};
 use crate::model;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -602,7 +603,15 @@ fn parse_jsonl(
     let mut cwd = None;
 
     if prev_file_size > 0 {
-        let _ = reader.seek(SeekFrom::Start(prev_file_size));
+        if reader.seek(SeekFrom::Start(prev_file_size)).is_err() {
+            // If seek fails, fall back to reading from the start with fresh counters
+            // rather than silently re-processing with stale carry-forward values.
+            total_input = 0;
+            total_output = 0;
+            model = None;
+            effort = None;
+            last_activity = None;
+        }
     } else {
         total_input = 0;
         total_output = 0;
@@ -611,18 +620,22 @@ fn parse_jsonl(
         last_activity = None;
     }
 
-    const MAX_LINE_LEN: usize = 10 * 1024 * 1024; // 10 MB per line
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => break,
+            Err(e) => {
+                // Retry on interrupted reads; skip lines with invalid data
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
         }
 
-        // Skip lines that are unreasonably large to prevent memory exhaustion
-        if line.len() > MAX_LINE_LEN {
+        // read_line_capped clears the buffer for oversized lines
+        if line.is_empty() {
             continue;
         }
 
@@ -862,12 +875,10 @@ fn is_clear_born(path: &Path) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
-    let mut reader = reader;
     for _ in 0..5 {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -972,8 +983,16 @@ pub fn find_session_cwd(session_id: &str) -> Option<String> {
             continue;
         }
         let file = fs::File::open(&jsonl_path).ok()?;
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines().take(20).flatten() {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        for _ in 0..20 {
+            match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if line.is_empty() {
+                continue;
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
                     return Some(cwd.to_string());

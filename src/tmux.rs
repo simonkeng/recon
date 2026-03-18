@@ -55,7 +55,12 @@ pub fn resume_session(session_id: &str, name: Option<&str>) -> Result<String, St
         .unwrap_or_else(|| session_id[..6.min(session_id.len())].to_string());
 
     // Use the original session's cwd so we start in the right project directory.
+    // Validate the CWD before passing to tmux to prevent path traversal.
     let cwd = session::find_session_cwd(session_id)
+        .filter(|p| {
+            let path = std::path::Path::new(p);
+            path.is_absolute() && path.canonicalize().map(|c| c.is_dir()).unwrap_or(false)
+        })
         .or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().to_string()).ok())
         .unwrap_or_else(|| ".".to_string());
 
@@ -150,15 +155,17 @@ fn sanitize_session_name(name: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .map(|c| match c {
-            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' => '-',
+            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' | '#' | '?' | '{' | '}' | '~' => '-',
             _ => c,
         })
         .collect();
-    // Ensure the name is not empty after sanitization
+    // Strip leading dashes — a name starting with '-' can confuse tmux
+    // argument parsing (interpreted as a flag).
+    let sanitized = sanitized.trim_start_matches('-');
     if sanitized.is_empty() {
         "session".to_string()
     } else {
-        sanitized
+        sanitized.to_string()
     }
 }
 
@@ -169,6 +176,8 @@ mod tests {
     #[test]
     fn sanitize_replaces_dots_and_colons() {
         assert_eq!(sanitize_session_name("my.app:v2"), "my-app-v2");
+        // Leading dot becomes dash, then stripped
+        assert_eq!(sanitize_session_name(".app"), "app");
     }
 
     #[test]
@@ -196,8 +205,20 @@ mod tests {
 
     #[test]
     fn sanitize_all_special_chars_returns_session() {
-        // All chars map to '-', but dashes are kept, so not empty
-        assert_eq!(sanitize_session_name(".:"), "--");
+        // All chars map to '-', then leading dashes are stripped → empty → "session"
+        assert_eq!(sanitize_session_name(".:"), "session");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_dashes() {
+        assert_eq!(sanitize_session_name("--my-project"), "my-project");
+        assert_eq!(sanitize_session_name("---"), "session");
+        assert_eq!(sanitize_session_name(".project"), "project");
+    }
+
+    #[test]
+    fn sanitize_replaces_additional_special_chars() {
+        assert_eq!(sanitize_session_name("a#b?c{d}e~f"), "a-b-c-d-e-f");
     }
 
     #[test]
