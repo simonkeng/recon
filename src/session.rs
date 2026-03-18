@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
+use crate::io_util::{read_line_capped, MAX_LINE_LEN};
 use crate::model;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -442,7 +443,30 @@ fn git_project_info(cwd: &str) -> (String, Option<String>) {
     (repo_name, branch)
 }
 
+/// Validate that a CWD path is safe to pass to external commands.
+/// Rejects paths that are not absolute, do not exist as a directory,
+/// or resolve (via symlinks) to a different location than expected.
+fn is_safe_cwd(cwd: &str) -> bool {
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return false;
+    }
+    // Resolve symlinks and verify the canonical path still exists as a directory.
+    // This prevents symlink-based path traversal (e.g. a symlink in ~/.claude/
+    // pointing to /etc or other sensitive directories).
+    match path.canonicalize() {
+        Ok(canonical) => canonical.is_dir(),
+        Err(_) => false,
+    }
+}
+
 fn fetch_git_repo_name(cwd: &str) -> String {
+    if !is_safe_cwd(cwd) {
+        return Path::new(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| cwd.to_string());
+    }
     match std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--show-toplevel"])
         .output()
@@ -462,6 +486,9 @@ fn fetch_git_repo_name(cwd: &str) -> String {
 }
 
 fn fetch_git_branch(cwd: &str) -> Option<String> {
+    if !is_safe_cwd(cwd) {
+        return None;
+    }
     let output = std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -576,7 +603,15 @@ fn parse_jsonl(
     let mut cwd = None;
 
     if prev_file_size > 0 {
-        let _ = reader.seek(SeekFrom::Start(prev_file_size));
+        if reader.seek(SeekFrom::Start(prev_file_size)).is_err() {
+            // If seek fails, fall back to reading from the start with fresh counters
+            // rather than silently re-processing with stale carry-forward values.
+            total_input = 0;
+            total_output = 0;
+            model = None;
+            effort = None;
+            last_activity = None;
+        }
     } else {
         total_input = 0;
         total_output = 0;
@@ -587,11 +622,21 @@ fn parse_jsonl(
 
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => break,
+            Err(e) => {
+                // Retry on interrupted reads; skip lines with invalid data
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+        }
+
+        // read_line_capped clears the buffer for oversized lines
+        if line.is_empty() {
+            continue;
         }
 
         let trimmed = line.trim();
@@ -830,12 +875,10 @@ fn is_clear_born(path: &Path) -> bool {
         Ok(f) => f,
         Err(_) => return false,
     };
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut line = String::new();
-    let mut reader = reader;
     for _ in 0..5 {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -940,8 +983,16 @@ pub fn find_session_cwd(session_id: &str) -> Option<String> {
             continue;
         }
         let file = fs::File::open(&jsonl_path).ok()?;
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines().take(20).flatten() {
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        for _ in 0..20 {
+            match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if line.is_empty() {
+                continue;
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
                     return Some(cwd.to_string());
@@ -1152,5 +1203,44 @@ fn find_claude_child_pid(parent_pid: i32) -> Option<i32> {
         .lines()
         .filter_map(|l| l.trim().parse::<i32>().ok())
         .find(|pid| sessions_dir.join(format!("{pid}.json")).exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_safe_cwd_rejects_relative_paths() {
+        assert!(!is_safe_cwd("relative/path"));
+        assert!(!is_safe_cwd("./here"));
+        assert!(!is_safe_cwd("../parent"));
+    }
+
+    #[test]
+    fn is_safe_cwd_rejects_nonexistent_absolute_paths() {
+        assert!(!is_safe_cwd("/nonexistent/path/that/does/not/exist/xyz123"));
+    }
+
+    #[test]
+    fn is_safe_cwd_accepts_real_directories() {
+        assert!(is_safe_cwd("/tmp"));
+        // Home directory should always exist
+        if let Some(home) = dirs::home_dir() {
+            assert!(is_safe_cwd(&home.to_string_lossy()));
+        }
+    }
+
+    #[test]
+    fn fetch_git_repo_name_handles_nonexistent_cwd() {
+        // Should return the basename, not panic or invoke git
+        let result = fetch_git_repo_name("/nonexistent/path/my-project");
+        assert_eq!(result, "my-project");
+    }
+
+    #[test]
+    fn fetch_git_branch_handles_nonexistent_cwd() {
+        let result = fetch_git_branch("/nonexistent/path/my-project");
+        assert!(result.is_none());
+    }
 }
 

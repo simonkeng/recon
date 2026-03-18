@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod history;
+mod io_util;
 mod model;
 mod new_session;
 mod park;

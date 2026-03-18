@@ -55,7 +55,12 @@ pub fn resume_session(session_id: &str, name: Option<&str>) -> Result<String, St
         .unwrap_or_else(|| session_id[..6.min(session_id.len())].to_string());
 
     // Use the original session's cwd so we start in the right project directory.
+    // Validate the CWD before passing to tmux to prevent path traversal.
     let cwd = session::find_session_cwd(session_id)
+        .filter(|p| {
+            let path = std::path::Path::new(p);
+            path.is_absolute() && path.canonicalize().map(|c| c.is_dir()).unwrap_or(false)
+        })
         .or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().to_string()).ok())
         .unwrap_or_else(|| ".".to_string());
 
@@ -141,7 +146,84 @@ pub fn kill_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Sanitize a string for use as a tmux session name (no dots or colons).
+/// Sanitize a string for use as a tmux session name.
+/// Strips characters that are special in tmux target specifications
+/// (dots, colons, equals, dollar, exclamation, percent, at, spaces)
+/// and removes control characters.
 fn sanitize_session_name(name: &str) -> String {
-    name.replace('.', "-").replace(':', "-")
+    let sanitized: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' | '#' | '?' | '{' | '}' | '~' => '-',
+            _ => c,
+        })
+        .collect();
+    // Strip leading dashes — a name starting with '-' can confuse tmux
+    // argument parsing (interpreted as a flag).
+    let sanitized = sanitized.trim_start_matches('-');
+    if sanitized.is_empty() {
+        "session".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_dots_and_colons() {
+        assert_eq!(sanitize_session_name("my.app:v2"), "my-app-v2");
+        // Leading dot becomes dash, then stripped
+        assert_eq!(sanitize_session_name(".app"), "app");
+    }
+
+    #[test]
+    fn sanitize_replaces_tmux_special_chars() {
+        assert_eq!(sanitize_session_name("te$t!app@home"), "te-t-app-home");
+        assert_eq!(sanitize_session_name("a=b%c"), "a-b-c");
+    }
+
+    #[test]
+    fn sanitize_replaces_spaces() {
+        assert_eq!(sanitize_session_name("my project"), "my-project");
+        // \t is a control character, so it gets stripped entirely
+        assert_eq!(sanitize_session_name("a\tb"), "ab");
+    }
+
+    #[test]
+    fn sanitize_strips_control_characters() {
+        assert_eq!(sanitize_session_name("test\x00name\x1b"), "testname");
+    }
+
+    #[test]
+    fn sanitize_empty_string_returns_session() {
+        assert_eq!(sanitize_session_name(""), "session");
+    }
+
+    #[test]
+    fn sanitize_all_special_chars_returns_session() {
+        // All chars map to '-', then leading dashes are stripped → empty → "session"
+        assert_eq!(sanitize_session_name(".:"), "session");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_dashes() {
+        assert_eq!(sanitize_session_name("--my-project"), "my-project");
+        assert_eq!(sanitize_session_name("---"), "session");
+        assert_eq!(sanitize_session_name(".project"), "project");
+    }
+
+    #[test]
+    fn sanitize_replaces_additional_special_chars() {
+        assert_eq!(sanitize_session_name("a#b?c{d}e~f"), "a-b-c-d-e-f");
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_names() {
+        assert_eq!(sanitize_session_name("my-project-123"), "my-project-123");
+        assert_eq!(sanitize_session_name("api-refactor"), "api-refactor");
+    }
 }
