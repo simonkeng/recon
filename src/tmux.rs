@@ -141,7 +141,23 @@ pub fn kill_session(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Sanitize a string for use as a tmux session name (no dots or colons).
+/// Sanitize a string for use as a tmux session name.
+/// Strips characters that are special in tmux target specifications
+/// (dots, colons, equals, dollar, exclamation, percent, at, spaces)
+/// and removes control characters.
 fn sanitize_session_name(name: &str) -> String {
-    name.replace('.', "-").replace(':', "-")
+    let sanitized: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' | '\t' => '-',
+            _ => c,
+        })
+        .collect();
+    // Ensure the name is not empty after sanitization
+    if sanitized.is_empty() {
+        "session".to_string()
+    } else {
+        sanitized
+    }
 }

@@ -442,7 +442,24 @@ fn git_project_info(cwd: &str) -> (String, Option<String>) {
     (repo_name, branch)
 }
 
+/// Validate that a CWD path is safe to pass to external commands.
+/// Rejects paths that are not absolute or that resolve (via symlinks) to
+/// a location outside the original directory tree.
+fn is_safe_cwd(cwd: &str) -> bool {
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return false;
+    }
+    path.is_dir()
+}
+
 fn fetch_git_repo_name(cwd: &str) -> String {
+    if !is_safe_cwd(cwd) {
+        return Path::new(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| cwd.to_string());
+    }
     match std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--show-toplevel"])
         .output()
@@ -462,6 +479,9 @@ fn fetch_git_repo_name(cwd: &str) -> String {
 }
 
 fn fetch_git_branch(cwd: &str) -> Option<String> {
+    if !is_safe_cwd(cwd) {
+        return None;
+    }
     let output = std::process::Command::new("git")
         .args(["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -585,6 +605,7 @@ fn parse_jsonl(
         last_activity = None;
     }
 
+    const MAX_LINE_LEN: usize = 10 * 1024 * 1024; // 10 MB per line
     let mut line = String::new();
     loop {
         line.clear();
@@ -592,6 +613,11 @@ fn parse_jsonl(
             Ok(0) => break,
             Ok(_) => {}
             Err(_) => break,
+        }
+
+        // Skip lines that are unreasonably large to prevent memory exhaustion
+        if line.len() > MAX_LINE_LEN {
+            continue;
         }
 
         let trimmed = line.trim();

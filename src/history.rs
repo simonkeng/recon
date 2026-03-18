@@ -304,18 +304,52 @@ struct JsonlSummary {
 }
 
 /// Read model, branch, and total tokens from the last assistant entry in a JSONL file.
+/// Uses a buffered reader and reads only the last portion of the file to avoid
+/// loading potentially large JSONL files entirely into memory.
 fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
         Err(_) => return JsonlSummary { model: None, branch: None, tokens: 0 },
     };
+
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    // Read at most the last 512KB — enough to find recent entries without
+    // loading multi-MB session files.
+    const TAIL_SIZE: u64 = 512 * 1024;
+    let mut reader = BufReader::new(file);
+    let seek_pos = file_len.saturating_sub(TAIL_SIZE);
+    if seek_pos > 0 {
+        let _ = reader.seek(SeekFrom::Start(seek_pos));
+        // Discard partial first line after seeking
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
+
+    // Collect the tail lines so we can iterate in reverse
+    const MAX_LINE_LEN: usize = 10 * 1024 * 1024;
+    let mut tail_lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if line.len() <= MAX_LINE_LEN {
+            tail_lines.push(line.clone());
+        }
+    }
 
     let mut model = None;
     let mut branch = None;
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
 
-    for line in content.lines().rev().take(50) {
+    for line in tail_lines.iter().rev().take(50) {
         // Pick up gitBranch from any recent entry
         if branch.is_none() && line.contains("\"gitBranch\"") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
@@ -348,7 +382,7 @@ fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
     JsonlSummary {
         model,
         branch,
-        tokens: input_tokens + output_tokens,
+        tokens: input_tokens.saturating_add(output_tokens),
     }
 }
 
