@@ -150,7 +150,7 @@ fn sanitize_session_name(name: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .map(|c| match c {
-            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' | '\t' => '-',
+            '.' | ':' | '=' | '$' | '!' | '%' | '@' | ' ' => '-',
             _ => c,
         })
         .collect();

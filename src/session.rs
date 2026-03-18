@@ -443,14 +443,20 @@ fn git_project_info(cwd: &str) -> (String, Option<String>) {
 }
 
 /// Validate that a CWD path is safe to pass to external commands.
-/// Rejects paths that are not absolute or that resolve (via symlinks) to
-/// a location outside the original directory tree.
+/// Rejects paths that are not absolute, do not exist as a directory,
+/// or resolve (via symlinks) to a different location than expected.
 fn is_safe_cwd(cwd: &str) -> bool {
     let path = Path::new(cwd);
     if !path.is_absolute() {
         return false;
     }
-    path.is_dir()
+    // Resolve symlinks and verify the canonical path still exists as a directory.
+    // This prevents symlink-based path traversal (e.g. a symlink in ~/.claude/
+    // pointing to /etc or other sensitive directories).
+    match path.canonicalize() {
+        Ok(canonical) => canonical.is_dir(),
+        Err(_) => false,
+    }
 }
 
 fn fetch_git_repo_name(cwd: &str) -> String {
