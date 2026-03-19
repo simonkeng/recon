@@ -236,9 +236,9 @@ if should_run "token_stability"; then
     fi
 fi
 
-# --- Test 5: Sort by creation time (newest first) ---
+# --- Test 5: Sort by last activity (most recent first) ---
 if should_run "sort_order"; then
-    # Ensure both sessions exist
+    # Ensure both sessions exist and are idle
     if ! tmux has-session -t "$S_NEW" 2>/dev/null; then
         create_session "$S_NEW" "$TMPDIR_NEW"
         wait_for_state "$S_NEW" "New" 15 >/dev/null 2>&1 || true
@@ -254,12 +254,17 @@ if should_run "sort_order"; then
         wait_for_state "$S_TWIN" "Idle" 20 >/dev/null 2>&1 || true
     fi
 
+    # Send a prompt to S_TWIN so it has the most recent activity
+    sleep 2
+    send_to_session "$S_TWIN" "say exactly: most recent"
+    wait_for_state "$S_TWIN" "Idle" 20 >/dev/null 2>&1 || true
+
     json=$("$RECON" json 2>/dev/null)
     idx_new=$(echo "$json" | jq -r --arg n "$S_NEW" '.sessions | to_entries[] | select(.value.tmux_session == $n) | .key')
     idx_twin=$(echo "$json" | jq -r --arg n "$S_TWIN" '.sessions | to_entries[] | select(.value.tmux_session == $n) | .key')
 
     if [[ -n "$idx_new" && -n "$idx_twin" ]] && (( idx_twin < idx_new )); then
-        report pass "Sort order: $S_TWIN (idx=$idx_twin) before $S_NEW (idx=$idx_new) — newest first"
+        report pass "Sort order: $S_TWIN (idx=$idx_twin) before $S_NEW (idx=$idx_new) — most recent activity first"
     else
         report fail "Sort order: expected $S_TWIN before $S_NEW (got idx_twin=$idx_twin idx_new=$idx_new)"
     fi
