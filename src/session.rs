@@ -463,7 +463,6 @@ fn is_safe_cwd(cwd: &str) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    // Resolve symlinks and verify the canonical path exists as a directory.
     match path.canonicalize() {
         Ok(canonical) => canonical.is_dir(),
         Err(_) => false,
@@ -758,7 +757,7 @@ fn find_jsonl_for_resumed_session(tmux_session: &str, pid: i32) -> Option<PathBu
         // Fall back to parsing ps args
         .or_else(|| parse_resume_id_from_ps(pid))?;
 
-    find_jsonl_by_session_id(&original_id)
+    resolve_session_jsonl(&original_id)
 }
 
 /// Read a variable from a tmux session's environment table.
@@ -993,11 +992,6 @@ fn resolve_session_jsonl(session_id: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Find the JSONL file for a given session-id by scanning all project directories.
-fn find_jsonl_by_session_id(session_id: &str) -> Option<PathBuf> {
-    resolve_session_jsonl(session_id)
 }
 
 /// Return session-id → tmux info for all currently live claude sessions.

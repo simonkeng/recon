@@ -28,10 +28,7 @@ fn park_file_path() -> Option<PathBuf> {
 fn is_symlink(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(m) => m.file_type().is_symlink(),
-        Err(_) => {
-            // Fail closed: if we can't determine symlink status, treat as unsafe
-            true
-        }
+        Err(_) => true,
     }
 }
 
