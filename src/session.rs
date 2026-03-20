@@ -9,6 +9,19 @@ use serde::Deserialize;
 use crate::io_util::{read_line_capped, MAX_LINE_LEN};
 use crate::model;
 
+const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Accept only safe session IDs: non-empty, at most 128 bytes, containing only
+/// alphanumeric characters, hyphens, and underscores.
+/// This blocks path traversal and shell-like metacharacters.
+pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_LEN
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     New,
@@ -444,16 +457,12 @@ fn git_project_info(cwd: &str) -> (String, Option<String>) {
 }
 
 /// Validate that a CWD path is safe to pass to external commands.
-/// Rejects paths that are not absolute, do not exist as a directory,
-/// or resolve (via symlinks) to a different location than expected.
+/// Rejects paths that are not absolute or do not resolve to an existing directory.
 fn is_safe_cwd(cwd: &str) -> bool {
     let path = Path::new(cwd);
     if !path.is_absolute() {
         return false;
     }
-    // Resolve symlinks and verify the canonical path still exists as a directory.
-    // This prevents symlink-based path traversal (e.g. a symlink in ~/.claude/
-    // pointing to /etc or other sensitive directories).
     match path.canonicalize() {
         Ok(canonical) => canonical.is_dir(),
         Err(_) => false,
@@ -748,7 +757,7 @@ fn find_jsonl_for_resumed_session(tmux_session: &str, pid: i32) -> Option<PathBu
         // Fall back to parsing ps args
         .or_else(|| parse_resume_id_from_ps(pid))?;
 
-    find_jsonl_by_session_id(&original_id)
+    resolve_session_jsonl(&original_id)
 }
 
 /// Read a variable from a tmux session's environment table.
@@ -930,20 +939,61 @@ fn find_recent_unmatched_jsonl(
     best.map(|(p, _)| p)
 }
 
-/// Find the JSONL file for a given session-id by scanning all project directories.
-fn find_jsonl_by_session_id(session_id: &str) -> Option<PathBuf> {
+/// Resolve and validate a JSONL path for a given session ID.
+/// Validates the session ID, then scans project directories for a matching JSONL file,
+/// canonicalizes the path, and verifies it stays within the projects directory.
+fn resolve_session_jsonl(session_id: &str) -> Option<PathBuf> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
+
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let canonical_projects = match projects_dir.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot resolve {}: {e}",
+                projects_dir.display()
+            );
+            return None;
+        }
+    };
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
         let candidate = entry.path().join(format!("{session_id}.jsonl"));
-        if candidate.exists() {
-            return Some(candidate);
+        if !candidate.exists() {
+            continue;
+        }
+        let canonical_candidate = match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "Warning: cannot canonicalize {}: {e}",
+                    candidate.display()
+                );
+                continue;
+            }
+        };
+        if !canonical_candidate.starts_with(&canonical_projects) {
+            continue;
+        }
+        if canonical_candidate
+            .extension()
+            .map(|e| e == "jsonl")
+            .unwrap_or(false)
+        {
+            return Some(canonical_candidate);
         }
     }
     None
 }
 
-/// Find the cwd used by an existing session (by scanning its JSONL for a cwd entry).
-/// Used by the resume command to start the tmux session in the right directory.
 /// Return session-id → tmux info for all currently live claude sessions.
 /// Used by the resume picker to filter out still-running sessions.
 pub fn build_live_session_map_public() -> HashMap<String, String> {
@@ -976,38 +1026,34 @@ pub fn find_live_tmux_for_session(session_id: &str) -> Option<String> {
 }
 
 pub fn find_session_cwd(session_id: &str) -> Option<String> {
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-    for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
-        let jsonl_path = entry.path().join(format!("{session_id}.jsonl"));
-        if !jsonl_path.exists() {
+    let jsonl_path = resolve_session_jsonl(session_id)?;
+
+    let file = match fs::File::open(&jsonl_path) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    for _ in 0..20 {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.is_empty() {
             continue;
         }
-        let file = fs::File::open(&jsonl_path).ok()?;
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        for _ in 0..20 {
-            match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-                    return Some(cwd.to_string());
-                }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                return Some(cwd.to_string());
             }
         }
     }
     None
 }
 
-/// Determine session status from file recency and token counts.
-/// - New: no tokens yet (never interacted)
-/// - Working: JSONL modified in last 5s
-/// - Input: last activity within 10 minutes (active conversation, waiting for user)
-/// - Idle: last activity older than 10 minutes
+/// Determine session status from token counts and tmux pane content.
+/// - New: no tokens yet (input and output both zero)
+/// - Otherwise: delegates to pane_status() to inspect the Claude Code TUI status bar
 fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, tmux_session: Option<&str>) -> SessionStatus {
     if input_tokens == 0 && output_tokens == 0 {
         return SessionStatus::New;
@@ -1242,5 +1288,30 @@ mod tests {
         let result = fetch_git_branch("/nonexistent/path/my-project");
         assert!(result.is_none());
     }
-}
 
+    #[test]
+    fn session_id_validation_accepts_expected_format() {
+        assert!(is_valid_session_id("abc123-def456"));
+        assert!(is_valid_session_id("A1-B2-C3"));
+        assert!(is_valid_session_id("abc_DEF-123"));
+    }
+
+    #[test]
+    fn session_id_validation_rejects_path_or_control_chars() {
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("../escape"));
+        assert!(!is_valid_session_id("bad/session"));
+        assert!(!is_valid_session_id("bad session"));
+        assert!(!is_valid_session_id("bad\x1bid"));
+        assert!(!is_valid_session_id("bad\x00id"));
+    }
+
+    #[test]
+    fn session_id_validation_enforces_length_limit() {
+        let at_limit: String = "a".repeat(MAX_SESSION_ID_LEN);
+        assert!(is_valid_session_id(&at_limit));
+
+        let over_limit: String = "a".repeat(MAX_SESSION_ID_LEN + 1);
+        assert!(!is_valid_session_id(&over_limit));
+    }
+}
