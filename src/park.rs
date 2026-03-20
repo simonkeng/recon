@@ -1,3 +1,6 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
@@ -16,8 +19,79 @@ struct ParkedSession {
     cwd: String,
 }
 
-fn park_file_path() -> Option<std::path::PathBuf> {
+fn park_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local").join("state").join("recon").join("parked.json"))
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn ensure_secure_parent_dir(parent: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
+
+    if is_symlink(parent) {
+        return Err("Refusing to use symlinked park directory".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to secure park directory permissions: {e}"))?;
+    }
+
+    Ok(())
+}
+
+fn write_park_file_secure(path: &Path, content: &str) -> Result<(), String> {
+    if is_symlink(path) {
+        return Err("Refusing to write through symlinked park file".to_string());
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Invalid park file path (missing parent)".to_string())?;
+    if is_symlink(parent) {
+        return Err("Refusing to use symlinked park directory".to_string());
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".parked.json.tmp-{}-{nonce}", std::process::id()));
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o600);
+    }
+
+    let mut file = open_opts
+        .open(&tmp_path)
+        .map_err(|e| format!("Failed to create temporary park file: {e}"))?;
+
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to write temporary park file: {e}"));
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("Failed to sync temporary park file: {e}"));
+    }
+    drop(file);
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("Failed to finalize park file: {e}")
+    })?;
+
+    Ok(())
 }
 
 pub fn park() {
@@ -64,8 +138,8 @@ pub fn park() {
     };
 
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("Failed to create directory: {e}");
+        if let Err(e) = ensure_secure_parent_dir(parent) {
+            eprintln!("{e}");
             return;
         }
     }
@@ -78,8 +152,8 @@ pub fn park() {
         }
     };
 
-    if let Err(e) = std::fs::write(&path, json) {
-        eprintln!("Failed to write park file: {e}");
+    if let Err(e) = write_park_file_secure(&path, &json) {
+        eprintln!("{e}");
         return;
     }
 
@@ -105,6 +179,11 @@ pub fn unpark() {
             return;
         }
     };
+
+    if is_symlink(&path) {
+        eprintln!("Refusing to read symlinked park file.");
+        return;
+    }
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,

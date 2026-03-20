@@ -46,6 +46,10 @@ pub fn create_session(name: &str, cwd: &str) -> Result<String, String> {
 /// Resume a claude session in a new tmux session.
 /// No-op if the session is already running — returns the existing tmux name.
 pub fn resume_session(session_id: &str, name: Option<&str>) -> Result<String, String> {
+    if !session::is_valid_session_id(session_id) {
+        return Err("Invalid session ID format".to_string());
+    }
+
     if let Some(existing) = session::find_live_tmux_for_session(session_id) {
         return Ok(existing);
     }

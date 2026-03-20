@@ -9,6 +9,18 @@ use serde::Deserialize;
 use crate::io_util::{read_line_capped, MAX_LINE_LEN};
 use crate::model;
 
+const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Accept only safe session IDs (alnum + '-' + '_').
+/// This blocks path traversal and shell-like metacharacters.
+pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_LEN
+        && session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     New,
@@ -932,11 +944,37 @@ fn find_recent_unmatched_jsonl(
 
 /// Find the JSONL file for a given session-id by scanning all project directories.
 fn find_jsonl_by_session_id(session_id: &str) -> Option<PathBuf> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
+
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let canonical_projects = projects_dir.canonicalize().ok()?;
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
         let candidate = entry.path().join(format!("{session_id}.jsonl"));
-        if candidate.exists() {
-            return Some(candidate);
+        if !candidate.exists() {
+            continue;
+        }
+        let canonical_candidate = match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical_candidate.starts_with(&canonical_projects) {
+            continue;
+        }
+        if canonical_candidate
+            .extension()
+            .map(|e| e == "jsonl")
+            .unwrap_or(false)
+        {
+            return Some(canonical_candidate);
         }
     }
     None
@@ -976,13 +1014,38 @@ pub fn find_live_tmux_for_session(session_id: &str) -> Option<String> {
 }
 
 pub fn find_session_cwd(session_id: &str) -> Option<String> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
+
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
+    let canonical_projects = projects_dir.canonicalize().ok()?;
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
         let jsonl_path = entry.path().join(format!("{session_id}.jsonl"));
         if !jsonl_path.exists() {
             continue;
         }
-        let file = fs::File::open(&jsonl_path).ok()?;
+
+        let canonical_jsonl = match jsonl_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical_jsonl.starts_with(&canonical_projects) {
+            continue;
+        }
+        if canonical_jsonl
+            .extension()
+            .map(|e| e == "jsonl")
+            .unwrap_or(false)
+            == false
+        {
+            continue;
+        }
+
+        let file = match fs::File::open(&canonical_jsonl) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         for _ in 0..20 {
@@ -1242,5 +1305,20 @@ mod tests {
         let result = fetch_git_branch("/nonexistent/path/my-project");
         assert!(result.is_none());
     }
-}
 
+    #[test]
+    fn session_id_validation_accepts_expected_format() {
+        assert!(is_valid_session_id("abc123-def456"));
+        assert!(is_valid_session_id("A1-B2-C3"));
+        assert!(is_valid_session_id("abc_DEF-123"));
+    }
+
+    #[test]
+    fn session_id_validation_rejects_path_or_control_chars() {
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id("../escape"));
+        assert!(!is_valid_session_id("bad/session"));
+        assert!(!is_valid_session_id("bad session"));
+        assert!(!is_valid_session_id("bad\x1bid"));
+    }
+}
