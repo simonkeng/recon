@@ -75,8 +75,8 @@ impl App {
 
     fn jump_to_next_input(&mut self) {
         if let Some(session) = self.sessions.iter().find(|s| s.status == session::SessionStatus::Input) {
-            if let Some(name) = &session.tmux_session {
-                tmux::switch_to_session(name);
+            if let Some(target) = &session.pane_target {
+                tmux::switch_to_pane(target);
                 self.should_quit = true;
             }
         }
@@ -98,8 +98,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(session) = self.sessions.get(self.selected) {
-                    if let Some(name) = &session.tmux_session {
-                        tmux::switch_to_session(name);
+                    if let Some(target) = &session.pane_target {
+                        tmux::switch_to_pane(target);
                         self.should_quit = true;
                     }
                 }
@@ -130,8 +130,8 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(session) = self.selected_zoomed_session() {
-                        if let Some(name) = session.tmux_session.clone() {
-                            tmux::switch_to_session(&name);
+                        if let Some(target) = session.pane_target.clone() {
+                            tmux::switch_to_pane(&target);
                             self.should_quit = true;
                         }
                     }
@@ -153,7 +153,7 @@ impl App {
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "claude".to_string());
                         if let Ok(name) = tmux::create_session(&default_name, &cwd) {
-                            tmux::switch_to_session(&name);
+                            tmux::switch_to_pane(&name);
                             self.should_quit = true;
                         }
                     }
@@ -240,6 +240,7 @@ impl App {
                     "room_id": s.room_id(),
                     "relative_dir": s.relative_dir,
                     "tmux_session": s.tmux_session,
+                    "pane_target": s.pane_target,
                     "model": s.model,
                     "model_display": s.model_display(),
                     "total_input_tokens": s.total_input_tokens,

@@ -35,6 +35,7 @@ pub struct Session {
     pub cwd: String,
     pub relative_dir: Option<String>,
     pub tmux_session: Option<String>,
+    pub pane_target: Option<String>,
     pub model: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -211,7 +212,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 &path,
                 info.input_tokens,
                 info.output_tokens,
-                Some(&live.tmux_session),
+                Some(&live.pane_target),
             );
 
             matched_session_ids.insert(session_id.clone());
@@ -223,6 +224,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 cwd,
                 relative_dir,
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: info.model,
                 effort: info.effort,
                 total_input_tokens: info.input_tokens,
@@ -242,13 +244,19 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
     //   1. Brand-new sessions (no JSONL yet) → show as New placeholder
     //   2. Resumed sessions (claude --resume creates a new session-id in the session file
     //      but continues appending to the original JSONL) → find via lsof, show real data
-    let known_tmux: std::collections::HashSet<String> = sessions
+    //
+    // Dedup by PID, not tmux session name. Multiple Claude instances can share
+    // a tmux session (e.g. two panes). Deduping by session name would silently
+    // hide the second instance. PID is the unique identifier per Claude process,
+    // so each instance gets its own stable entry in the table — even if the TUI
+    // shows duplicate session names.
+    let known_pids: std::collections::HashSet<i32> = sessions
         .iter()
-        .filter_map(|s| s.tmux_session.clone())
+        .filter_map(|s| s.pid)
         .collect();
 
     for (session_id_key, live) in &live_map {
-        if known_tmux.contains(&live.tmux_session) {
+        if known_pids.contains(&live.pid) {
             continue;
         }
 
@@ -304,7 +312,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 &path,
                 info.input_tokens,
                 info.output_tokens,
-                Some(&live.tmux_session),
+                Some(&live.pane_target),
             );
 
             sessions.push(Session {
@@ -314,6 +322,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 branch,
                 cwd,
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: info.model,
                 effort: info.effort,
                 total_input_tokens: info.input_tokens,
@@ -335,6 +344,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 branch,
                 cwd: live.pane_cwd.clone(),
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: None,
                 effort: None,
                 total_input_tokens: 0,
@@ -398,6 +408,7 @@ fn truncate_to_minute(ts: &Option<String>) -> Option<String> {
 struct LiveSessionInfo {
     pid: i32,
     tmux_session: String,
+    pane_target: String,
     pane_cwd: String,
     started_at: u64,
 }
@@ -412,25 +423,28 @@ fn build_live_session_map() -> HashMap<String, LiveSessionInfo> {
     let tmux_panes = discover_claude_tmux_panes();
 
     let mut map = HashMap::new();
-    for (pid, tmux_session, pane_cwd) in tmux_panes {
+    for (pid, tmux_session, pane_target, pane_cwd) in tmux_panes {
         if let Some(info) = pid_session_map.get(&pid) {
             map.insert(
                 info.session_id.clone(),
                 LiveSessionInfo {
                     pid,
                     tmux_session,
+                    pane_target,
                     pane_cwd,
                     started_at: info.started_at,
                 },
             );
         } else {
             // Tmux pane running claude but no session file yet (just started).
-            // Use the tmux session name as a placeholder key.
+            // Use pane_target (not tmux session name) as placeholder key so that
+            // two Claude panes in the same tmux session don't collide.
             map.insert(
-                format!("tmux-{tmux_session}"),
+                format!("tmux-{pane_target}"),
                 LiveSessionInfo {
                     pid,
                     tmux_session,
+                    pane_target,
                     pane_cwd,
                     started_at: 0,
                 },
@@ -979,20 +993,20 @@ pub fn build_live_session_map_public() -> HashMap<String, String> {
 }
 
 /// Check if a session ID (JSONL-based) is already running in tmux.
-/// Returns the tmux session name if found.
+/// Returns the pane target (session:window.pane) if found.
 pub fn find_live_tmux_for_session(session_id: &str) -> Option<String> {
     let live_map = build_live_session_map();
 
     // Direct match: PID file's session_id == the one we're looking for.
     if let Some(info) = live_map.get(session_id) {
-        return Some(info.tmux_session.clone());
+        return Some(info.pane_target.clone());
     }
 
     // Resumed session: RECON_RESUMED_FROM env var matches.
     for (_, info) in &live_map {
         if let Some(orig_id) = read_tmux_env(&info.tmux_session, "RECON_RESUMED_FROM") {
             if orig_id == session_id {
-                return Some(info.tmux_session.clone());
+                return Some(info.pane_target.clone());
             }
         }
     }
@@ -1025,10 +1039,10 @@ pub fn find_session_cwd(session_id: &str) -> Option<String> {
 /// - Working: JSONL modified in last 5s
 /// - Input: last activity within 10 minutes (active conversation, waiting for user)
 /// - Idle: last activity older than 10 minutes
-fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, tmux_session: Option<&str>) -> SessionStatus {
+fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, pane_target: Option<&str>) -> SessionStatus {
     // tmux pane content is the source of truth for active sessions
-    if let Some(name) = tmux_session {
-        let pane = pane_status(name);
+    if let Some(target) = pane_target {
+        let pane = pane_status(target);
         // Only show New if pane also looks idle (no active streaming)
         if input_tokens == 0 && output_tokens == 0 && pane == SessionStatus::Idle {
             return SessionStatus::New;
@@ -1050,9 +1064,9 @@ fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, tmux_se
 ///     contains "…" — these are thinking/tool-execution progress indicators
 ///   - Input: "Esc to cancel" on the last line, or a selection menu ("❯ N.")
 ///   - Idle: anything else
-fn pane_status(session_name: &str) -> SessionStatus {
+fn pane_status(pane_target: &str) -> SessionStatus {
     let output = match std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", session_name, "-p"])
+        .args(["capture-pane", "-t", pane_target, "-p"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -1159,13 +1173,13 @@ fn read_pid_session_map() -> HashMap<i32, SessionFileInfo> {
 
 /// Get tmux panes running claude.
 /// Returns Vec<(pid, session_name, pane_cwd)>.
-fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
+fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
     let output = match std::process::Command::new("tmux")
         .args([
             "list-panes",
             "-a",
             "-F",
-            "#{pane_pid}|||#{session_name}|||#{pane_current_command}|||#{pane_current_path}",
+            "#{pane_pid}|||#{session_name}|||#{pane_current_command}|||#{pane_current_path}|||#{window_index}|||#{pane_index}",
         ])
         .output()
     {
@@ -1180,8 +1194,8 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
         .unwrap_or_default();
 
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(4, "|||").collect();
-        if parts.len() < 4 {
+        let parts: Vec<&str> = line.splitn(6, "|||").collect();
+        if parts.len() < 6 {
             continue;
         }
         let pid: i32 = match parts[0].parse() {
@@ -1191,6 +1205,8 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
         let session_name = parts[1];
         let command = parts[2];
         let pane_path = parts[3];
+        let window_index = parts[4];
+        let pane_index = parts[5];
 
         // Claude shows up as a version number (e.g. "2.1.76") or "claude" or "node"
         let is_claude = command
@@ -1211,11 +1227,13 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
                 find_claude_child_pid(pid)
             };
             if let Some(cpid) = claude_pid {
-                results.push((cpid, session_name.to_string(), pane_path.to_string()));
+                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
+                results.push((cpid, session_name.to_string(), pane_target, pane_path.to_string()));
             }
         } else if command == "bash" || command == "sh" || command == "zsh" {
             if let Some(claude_pid) = find_claude_child_pid(pid) {
-                results.push((claude_pid, session_name.to_string(), pane_path.to_string()));
+                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
+                results.push((claude_pid, session_name.to_string(), pane_target, pane_path.to_string()));
             }
         }
     }

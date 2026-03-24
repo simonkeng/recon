@@ -2,16 +2,17 @@ use std::process::Command;
 
 use crate::session;
 
-/// Switch to a tmux session (inside tmux) or attach to it (outside tmux).
-pub fn switch_to_session(name: &str) {
+/// Switch to a tmux pane (inside tmux) or attach to its session (outside tmux).
+/// `target` is a pane target like "mywork:0.0" (session:window.pane).
+pub fn switch_to_pane(target: &str) {
     let inside_tmux = std::env::var("TMUX").is_ok();
     if inside_tmux {
         let _ = Command::new("tmux")
-            .args(["switch-client", "-t", name])
+            .args(["switch-client", "-t", target])
             .status();
     } else {
         let _ = Command::new("tmux")
-            .args(["attach-session", "-t", name])
+            .args(["attach-session", "-t", target])
             .status();
     }
 }
