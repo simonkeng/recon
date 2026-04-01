@@ -152,6 +152,10 @@ bind X confirm-before -p "Kill session #S? (y/n)" kill-session
 
 This lets you pop open the dashboard from any tmux session, pick a session with `Enter`, and jump straight to it.
 
+## Known Limitations
+
+- **`/clear` resets session tracking** — Claude Code's `/clear` command creates a new JSONL file without updating the session-to-process mapping. After `/clear`, recon may show stale data (old tokens, old timestamps) until the session is restarted. Workaround: kill the session in recon and create a new one.
+
 ## Contribution Policy
 
 This project is not accepting code contributions (Pull Requests) at this time.

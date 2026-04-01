@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -274,12 +274,7 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 .get(session_id_key.as_str())
                 .filter(|s| !s.jsonl_path.as_os_str().is_empty())
                 .map(|s| s.jsonl_path.clone());
-            let resume_path = cached.or_else(|| find_jsonl_for_resumed_session(&live.tmux_session, live.pid));
-            // If a /clear successor exists, use it instead of the stale resume JSONL.
-            resume_path.map(|p| {
-                find_clear_successor(&live.pane_cwd, &matched_session_ids, &p)
-                    .unwrap_or(p)
-            })
+            cached.or_else(|| find_jsonl_for_resumed_session(&live.tmux_session, live.pid))
         } else {
             None
         };
@@ -356,34 +351,6 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 jsonl_path: PathBuf::new(),
                 last_file_size: 0,
             });
-        }
-    }
-
-    // Post-scan fixup: /clear creates a new JSONL without updating {PID}.json,
-    // so the first scan matches the OLD JSONL while the new one is ignored.
-    // Runs AFTER the unmatched loop so that resumed sessions claim their /clear
-    // successors first, preventing unrelated sessions from stealing them.
-    for session in &mut sessions {
-        if let Some(newer) =
-            find_clear_successor(&session.cwd, &matched_session_ids, &session.jsonl_path)
-        {
-            let info = parse_jsonl(&newer, 0, 0, 0, None, None, None);
-            let new_sid = newer
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            matched_session_ids.remove(&session.session_id);
-            matched_session_ids.insert(new_sid);
-            session.total_input_tokens = info.input_tokens;
-            session.total_output_tokens = info.output_tokens;
-            session.model = info.model;
-            session.effort = info.effort;
-            session.last_activity = info.last_activity;
-            session.last_file_size = info.file_size;
-            session.jsonl_path = newer;
-            if let Some(cwd) = info.cwd {
-                session.cwd = cwd;
-            }
         }
     }
 
@@ -886,83 +853,6 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     result
-}
-
-/// Encode a CWD path to a Claude project directory name.
-/// Claude Code replaces both `/` and `.` with `-`.
-fn encode_project_path(cwd: &str) -> String {
-    cwd.replace('/', "-").replace('.', "-")
-}
-
-/// Find the newest unmatched JSONL in the project directory for `cwd` that was
-/// created by `/clear` (has the `/clear` command marker in its first few lines)
-/// and is newer than `current_jsonl`. Returns None if no such file exists.
-fn find_clear_successor(
-    cwd: &str,
-    matched_session_ids: &std::collections::HashSet<String>,
-    current_jsonl: &Path,
-) -> Option<PathBuf> {
-    let cur_mtime = current_jsonl.metadata().ok().and_then(|m| m.modified().ok())?;
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-    let project_dir = projects_dir.join(encode_project_path(cwd));
-
-    if !project_dir.is_dir() {
-        return None;
-    }
-
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            continue;
-        }
-        let session_id = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if matched_session_ids.contains(&session_id) {
-            continue;
-        }
-        let modified = match path.metadata().ok().and_then(|m| m.modified().ok()) {
-            Some(t) => t,
-            None => continue,
-        };
-        // Must be newer than the current JSONL
-        if modified <= cur_mtime {
-            continue;
-        }
-        // Check for /clear marker in first few lines
-        if !is_clear_born(&path) {
-            continue;
-        }
-        if best.as_ref().map_or(true, |(_, t)| modified > *t) {
-            best = Some((path, modified));
-        }
-    }
-    best.map(|(p, _)| p)
-}
-
-/// Check if a JSONL file was created by `/clear` by looking for the command
-/// marker in its first few lines.
-fn is_clear_born(path: &Path) -> bool {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut reader = reader;
-    for _ in 0..5 {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.contains("<command-name>/clear</command-name>") {
-            return true;
-        }
-    }
-    false
 }
 
 /// Find the JSONL file for a given session-id by scanning all project directories.
