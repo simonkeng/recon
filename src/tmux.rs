@@ -17,9 +17,12 @@ pub fn switch_to_pane(target: &str) {
     }
 }
 
-/// Launch claude in a new tmux session with the given name and working directory.
+/// Launch a command in a new tmux session with the given name and working directory.
+/// If `command` is None, runs claude. Otherwise splits the command on whitespace
+/// and passes the parts as the binary + args to tmux (no shell wrapper, so aliases
+/// won't resolve — use full paths).
 /// Returns the session name on success.
-pub fn create_session(name: &str, cwd: &str) -> Result<String, String> {
+pub fn create_session(name: &str, cwd: &str, command: Option<&str>) -> Result<String, String> {
     if !session::validate_cwd(cwd) {
         return Err(format!("Invalid working directory: {cwd}"));
     }
@@ -27,17 +30,29 @@ pub fn create_session(name: &str, cwd: &str) -> Result<String, String> {
     let base_name = sanitize_session_name(name);
     let session_name = unique_session_name(&base_name);
 
-    let claude_path = which_claude().unwrap_or_else(|| "claude".to_string());
+    let mut tmux_args = vec![
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-s".to_string(),
+        session_name.clone(),
+        "-c".to_string(),
+        cwd.to_string(),
+    ];
+
+    match command {
+        Some(cmd) => {
+            for part in cmd.split_whitespace() {
+                tmux_args.push(part.to_string());
+            }
+        }
+        None => {
+            let claude_path = which_claude().unwrap_or_else(|| "claude".to_string());
+            tmux_args.push(claude_path);
+        }
+    }
+
     let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &session_name,
-            "-c",
-            cwd,
-            &claude_path,
-        ])
+        .args(&tmux_args)
         .status()
         .map_err(|e| format!("Failed to create tmux session: {e}"))?;
 

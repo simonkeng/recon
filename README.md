@@ -101,8 +101,9 @@ Requires tmux and [Claude Code](https://claude.ai/claude-code).
 recon                                        # Table dashboard
 recon view                                   # Tamagotchi visual dashboard
 recon json                                   # JSON output (for scripting)
-recon launch                                 # Create a new claude session in the current directory
-recon launch --name-only                     # Print session name without attaching
+recon launch                                 # Create a new claude session (background)
+recon launch --name foo --cwd ~/repos/myapp  # Custom name and directory
+recon launch --command "claude --model sonnet" --attach  # Custom command, attach to session
 recon new                                    # Interactive new session form
 recon resume                                 # Interactive resume picker
 recon resume --id <session-id>               # Resume a specific session

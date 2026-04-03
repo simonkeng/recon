@@ -14,11 +14,20 @@ pub enum Command {
     View,
     /// Interactive form to create a new tmux session
     New,
-    /// Create a new claude session in the current directory
+    /// Create a new claude session (background by default)
     Launch {
-        /// Print only the session name (no attach)
+        /// Custom session name (defaults to directory name)
         #[arg(long)]
-        name_only: bool,
+        name: Option<String>,
+        /// Working directory (defaults to current directory)
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Custom command to run instead of claude (e.g. "claude --model sonnet")
+        #[arg(long)]
+        command: Option<String>,
+        /// Attach to the session after creating it
+        #[arg(long)]
+        attach: bool,
     },
     /// Jump directly to the next agent waiting for input
     Next,
