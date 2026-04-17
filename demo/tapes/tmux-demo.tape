@@ -21,6 +21,8 @@ Type "j"
 Sleep 400ms
 Type "j"
 Sleep 400ms
+Type "j"
+Sleep 400ms
 Type "k"
 Sleep 400ms
 Type "k"
@@ -30,13 +32,11 @@ Sleep 1.5s
 Type "v"
 Sleep 4s
 
-# --- Zoom into room 1 (busy room with 3 agents) ---
+# --- Zoom into room 1 (api-server with 2 agents) ---
 Type "1"
 Sleep 3s
 
 # --- Select agents within room ---
-Type "l"
-Sleep 700ms
 Type "l"
 Sleep 700ms
 Type "h"

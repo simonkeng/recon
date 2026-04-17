@@ -4,8 +4,8 @@
 Output readme.gif
 Set Shell bash
 Set FontSize 14
-Set Width 1200
-Set Height 600
+Set Width 1400
+Set Height 700
 Set Padding 10
 Set Theme "Catppuccin Mocha"
 
@@ -26,19 +26,24 @@ Sleep 1s
 Type "v"
 Sleep 3s
 
-# Zoom into room 1
+# Zoom into room 1 (api-server with 2 agents)
 Type "1"
 Sleep 2.5s
 
-# Select agents
-Type "l"
-Sleep 500ms
+# Select agent
 Type "l"
 Sleep 1s
 
 # Back out
 Escape
 Sleep 1.5s
+
+# Zoom into room 2 (api-server › services/auth — Input)
+Type "2"
+Sleep 2s
+
+Escape
+Sleep 1s
 
 Type "q"
 Sleep 300ms

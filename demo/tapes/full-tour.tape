@@ -24,21 +24,17 @@ Sleep 400ms
 Type "k"
 Sleep 400ms
 Type "k"
-Sleep 400ms
-Type "k"
 Sleep 1s
 
 # Switch to view mode
 Type "v"
 Sleep 4s
 
-# Zoom into room 1 (the busy room)
+# Zoom into room 1 (api-server with 2 agents)
 Type "1"
 Sleep 3s
 
 # Select agents
-Type "l"
-Sleep 700ms
 Type "l"
 Sleep 700ms
 

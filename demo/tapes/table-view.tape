@@ -1,4 +1,4 @@
-# VHS tape: recon table view with 7 agents
+# VHS tape: recon table view with 6 agents
 # Run: vhs demo/table-view.tape
 # Prerequisite: ./demo/demo.sh --setup  (in another terminal)
 
@@ -26,12 +26,8 @@ Type "j"
 Sleep 600ms
 Type "j"
 Sleep 600ms
-Type "j"
-Sleep 600ms
 
 # Navigate back up
-Type "k"
-Sleep 400ms
 Type "k"
 Sleep 400ms
 Type "k"

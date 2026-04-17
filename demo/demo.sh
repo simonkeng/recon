@@ -2,7 +2,8 @@
 #
 # demo.sh — Set up fake claude sessions for a recon demo.
 #
-# Creates 7 agents across 4 rooms with all states (New, Working, Idle, Input).
+# Creates 6 agents across 4 rooms with all states (New, Working, Idle, Input).
+# Includes a monorepo subdirectory room to showcase relative_dir grouping.
 # No real claude/API calls — uses node processes + fake session files.
 #
 # Usage:
@@ -43,7 +44,7 @@ cleanup() {
     echo "Cleaning up..."
     # Kill demo tmux sessions
     tmux list-sessions -F '#{session_name}' 2>/dev/null \
-        | grep "^demo-${RID}-" \
+        | grep "^d${RID}-" \
         | while read -r s; do tmux kill-session -t "$s" 2>/dev/null || true; done
     # Remove fake session files
     for f in "${FAKE_SESSION_FILES[@]}"; do
@@ -122,36 +123,36 @@ EOF
 
 # ===== Define demo rooms and agents =====
 
-# Room 1: ~/repos/api-server (main) — 3 agents
+# Room 1: api-server (main) — 2 agents at repo root
 DIR_API="$TMPDIR_BASE/repos/api-server"
 init_git_repo "$DIR_API" "main"
 
-# Room 2: ~/repos/frontend (feat/dashboard) — 2 agents
+# Room 2: api-server › services/auth (main) — 1 agent in subdirectory (same repo)
+DIR_AUTH="$DIR_API/services/auth"
+mkdir -p "$DIR_AUTH"
+
+# Room 3: frontend (feat/dashboard) — 2 agents
 DIR_FE="$TMPDIR_BASE/repos/frontend"
 init_git_repo "$DIR_FE" "feat/dashboard"
 
-# Room 3: ~/repos/infra (fix/terraform-drift) — 1 agent
-DIR_INFRA="$TMPDIR_BASE/repos/infra"
-init_git_repo "$DIR_INFRA" "fix/terraform-drift"
-
-# Room 4: ~/repos/mobile-app (main) — 1 agent
+# Room 4: mobile-app (feat/onboarding) — 1 agent
 DIR_MOBILE="$TMPDIR_BASE/repos/mobile-app"
 init_git_repo "$DIR_MOBILE" "feat/onboarding"
 
 echo ""
-echo "=== Creating 7 fake agents across 4 rooms ==="
+echo "=== Creating 6 fake agents across 4 rooms ==="
 
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 NOW_EPOCH=$(date +%s)
 
-# --- Room 1: api-server (3 agents) ---
+# --- Room 1: api-server (2 agents) ---
 
 # Agent 1: Working — actively streaming
 create_fake_agent \
-    "demo-${RID}-api-1" \
+    "d${RID}-api1" \
     "$DIR_API" \
     "demo-api-working-${RID}" \
-    "esc to interrupt" \
+    "✻ Reading file\u2026" \
     45000 8000 \
     "claude-sonnet-4-6" \
     "$NOW" \
@@ -159,7 +160,7 @@ create_fake_agent \
 
 # Agent 2: Idle — finished work
 create_fake_agent \
-    "demo-${RID}-api-2" \
+    "d${RID}-api2" \
     "$DIR_API" \
     "demo-api-idle-${RID}" \
     "? for shortcuts" \
@@ -168,25 +169,27 @@ create_fake_agent \
     "$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
     "$((NOW_EPOCH - 1200))"
 
+# --- Room 2: api-server › services/auth (1 agent, subdirectory of same repo) ---
+
 # Agent 3: Input — waiting for permission
 create_fake_agent \
-    "demo-${RID}-api-3" \
-    "$DIR_API" \
-    "demo-api-input-${RID}" \
+    "d${RID}-auth" \
+    "$DIR_AUTH" \
+    "demo-auth-input-${RID}" \
     "Esc to cancel" \
     30000 5000 \
     "claude-sonnet-4-6" \
     "$NOW" \
     "$((NOW_EPOCH - 180))"
 
-# --- Room 2: frontend (2 agents) ---
+# --- Room 3: frontend (2 agents) ---
 
 # Agent 4: Working
 create_fake_agent \
-    "demo-${RID}-fe-1" \
+    "d${RID}-fe1" \
     "$DIR_FE" \
     "demo-fe-working-${RID}" \
-    "esc to interrupt" \
+    "✻ Reading file\u2026" \
     80000 20000 \
     "claude-sonnet-4-6" \
     "$NOW" \
@@ -194,7 +197,7 @@ create_fake_agent \
 
 # Agent 5: Idle
 create_fake_agent \
-    "demo-${RID}-fe-2" \
+    "d${RID}-fe2" \
     "$DIR_FE" \
     "demo-fe-idle-${RID}" \
     "? for shortcuts" \
@@ -203,24 +206,11 @@ create_fake_agent \
     "$(date -u -v-45M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '45 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
     "$((NOW_EPOCH - 3600))"
 
-# --- Room 3: infra (1 agent) ---
-
-# Agent 6: Input — permission prompt
-create_fake_agent \
-    "demo-${RID}-infra-1" \
-    "$DIR_INFRA" \
-    "demo-infra-input-${RID}" \
-    "Esc to cancel" \
-    25000 3000 \
-    "claude-sonnet-4-6" \
-    "$NOW" \
-    "$((NOW_EPOCH - 120))"
-
 # --- Room 4: mobile-app (1 agent) ---
 
-# Agent 7: New — just started, no tokens
+# Agent 6: New — just started, no tokens
 create_fake_agent \
-    "demo-${RID}-mobile-1" \
+    "d${RID}-mobile" \
     "$DIR_MOBILE" \
     "demo-mobile-new-${RID}" \
     "? for shortcuts" \
@@ -232,10 +222,10 @@ create_fake_agent \
 echo ""
 echo "=== Demo ready ==="
 echo ""
-echo "  Room 1: api-server (main)          — 3 agents: Working, Idle, Input"
-echo "  Room 2: frontend (feat/dashboard)  — 2 agents: Working, Idle"
-echo "  Room 3: infra (fix/terraform-drift)— 1 agent:  Input"
-echo "  Room 4: mobile-app (feat/onboarding)— 1 agent:  New"
+echo "  Room 1: api-server (main)              — 2 agents: Working, Idle"
+echo "  Room 2: api-server › services/auth (main) — 1 agent:  Input"
+echo "  Room 3: frontend (feat/dashboard)      — 2 agents: Working, Idle"
+echo "  Room 4: mobile-app (feat/onboarding)   — 1 agent:  New"
 echo ""
 
 if [[ "${1:-}" == "--setup" ]]; then

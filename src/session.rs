@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -47,7 +47,9 @@ pub struct Session {
     pub project_name: String,
     pub branch: Option<String>,
     pub cwd: String,
+    pub relative_dir: Option<String>,
     pub tmux_session: Option<String>,
+    pub pane_target: Option<String>,
     pub model: Option<String>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -58,9 +60,17 @@ pub struct Session {
     pub started_at: u64,
     pub jsonl_path: PathBuf,
     pub last_file_size: u64,
+    pub tags: HashMap<String, String>,
 }
 
 impl Session {
+    pub fn room_id(&self) -> String {
+        match &self.relative_dir {
+            Some(dir) => format!("{} \u{203A} {}", self.project_name, dir),
+            None => self.project_name.clone(),
+        }
+    }
+
     pub fn token_display(&self) -> String {
         let used = self.total_input_tokens + self.total_output_tokens;
         let window = self
@@ -115,12 +125,13 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
     // by joining ~/.claude/sessions/{PID}.json with tmux pane info.
     let live_map = build_live_session_map();
 
-    let mut sessions = Vec::new();
+    let mut sessions: Vec<Session> = Vec::new();
     let mut matched_session_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let cutoff = SystemTime::now() - Duration::from_secs(24 * 3600);
 
-    // Scan all JSONL files across project directories
+    // Scan all JSONL files across project directories.
+    // No mtime cutoff needed — the live_map check (below) already filters out
+    // dead sessions, and skipping the stat() call is faster than doing it.
     let entries = match fs::read_dir(&claude_dir) {
         Ok(e) => e,
         Err(_) => return vec![],
@@ -146,15 +157,6 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 continue;
             }
 
-            let modified = path
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if modified < cutoff {
-                continue;
-            }
-
             let session_id = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
@@ -165,6 +167,43 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 Some(l) => l,
                 None => continue,
             };
+
+            // Same session_id can appear in multiple project dirs (e.g. session
+            // started in one CWD then moved to a worktree). Prefer the larger file.
+            if matched_session_ids.contains(&session_id) {
+                if let Some(existing) = sessions.iter_mut().find(|s| s.session_id == session_id) {
+                    let existing_size = existing.jsonl_path.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                    let new_size = path.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                    if new_size > existing_size {
+                        let prev = prev_sessions.get(&session_id);
+                        let info = parse_jsonl(
+                            &path,
+                            prev.map(|s| s.last_file_size).unwrap_or(0),
+                            prev.map(|s| s.total_input_tokens).unwrap_or(0),
+                            prev.map(|s| s.total_output_tokens).unwrap_or(0),
+                            prev.and_then(|s| s.model.clone()),
+                            prev.and_then(|s| s.effort.clone()),
+                            prev.and_then(|s| s.last_activity.clone()),
+                        );
+                        let cwd = info.cwd
+                            .or_else(|| prev.map(|s| s.cwd.clone()))
+                            .unwrap_or_else(|| decode_project_path(&project_dir));
+                        let (project_name, relative_dir, branch) = git_project_info(&cwd);
+                        existing.project_name = project_name;
+                        existing.relative_dir = relative_dir;
+                        existing.branch = branch;
+                        existing.cwd = cwd;
+                        existing.model = info.model;
+                        existing.effort = info.effort;
+                        existing.total_input_tokens = info.input_tokens;
+                        existing.total_output_tokens = info.output_tokens;
+                        existing.last_activity = info.last_activity;
+                        existing.jsonl_path = path;
+                        existing.last_file_size = info.file_size;
+                    }
+                }
+                continue;
+            }
 
             // Incremental JSONL parsing
             let prev = prev_sessions.get(&session_id);
@@ -180,24 +219,28 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
 
             let cwd = info
                 .cwd
+                .or_else(|| prev.map(|s| s.cwd.clone()))
                 .unwrap_or_else(|| decode_project_path(&project_dir));
-            let (project_name, branch) = git_project_info(&cwd);
+            let (project_name, relative_dir, branch) = git_project_info(&cwd);
 
             let status = determine_status(
                 &path,
                 info.input_tokens,
                 info.output_tokens,
-                Some(&live.tmux_session),
+                Some(&live.pane_target),
             );
 
             matched_session_ids.insert(session_id.clone());
 
+            let tags = read_tmux_tags(&live.tmux_session);
             sessions.push(Session {
                 session_id,
                 project_name,
                 branch,
                 cwd,
+                relative_dir,
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: info.model,
                 effort: info.effort,
                 total_input_tokens: info.input_tokens,
@@ -208,35 +251,8 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 started_at: live.started_at,
                 jsonl_path: path,
                 last_file_size: info.file_size,
+                tags,
             });
-        }
-    }
-
-    // Post-scan fixup: /clear creates a new JSONL without updating {PID}.json,
-    // so the first scan matches the OLD JSONL while the new one is ignored.
-    // Detect /clear-born JONLs (they have <command-name>/clear</command-name>
-    // in their first few lines) and switch matched sessions to the newest one.
-    for session in &mut sessions {
-        if let Some(newer) =
-            find_clear_successor(&session.cwd, &matched_session_ids, &session.jsonl_path)
-        {
-            let info = parse_jsonl(&newer, 0, 0, 0, None, None, None);
-            let new_sid = newer
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            matched_session_ids.remove(&session.session_id);
-            matched_session_ids.insert(new_sid);
-            session.total_input_tokens = info.input_tokens;
-            session.total_output_tokens = info.output_tokens;
-            session.model = info.model;
-            session.effort = info.effort;
-            session.last_activity = info.last_activity;
-            session.last_file_size = info.file_size;
-            session.jsonl_path = newer;
-            if let Some(cwd) = info.cwd {
-                session.cwd = cwd;
-            }
         }
     }
 
@@ -245,13 +261,19 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
     //   1. Brand-new sessions (no JSONL yet) → show as New placeholder
     //   2. Resumed sessions (claude --resume creates a new session-id in the session file
     //      but continues appending to the original JSONL) → find via lsof, show real data
-    let known_tmux: std::collections::HashSet<String> = sessions
+    //
+    // Dedup by PID, not tmux session name. Multiple Claude instances can share
+    // a tmux session (e.g. two panes). Deduping by session name would silently
+    // hide the second instance. PID is the unique identifier per Claude process,
+    // so each instance gets its own stable entry in the table — even if the TUI
+    // shows duplicate session names.
+    let known_pids: std::collections::HashSet<i32> = sessions
         .iter()
-        .filter_map(|s| s.tmux_session.clone())
+        .filter_map(|s| s.pid)
         .collect();
 
     for (session_id_key, live) in &live_map {
-        if known_tmux.contains(&live.tmux_session) {
+        if known_pids.contains(&live.pid) {
             continue;
         }
 
@@ -269,19 +291,12 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 .get(session_id_key.as_str())
                 .filter(|s| !s.jsonl_path.as_os_str().is_empty())
                 .map(|s| s.jsonl_path.clone());
-            let resume_path = cached.or_else(|| find_jsonl_for_resumed_session(&live.tmux_session, live.pid));
-            // Skip the resume path if a /clear successor exists in the same
-            // project dir — the resumed JSONL is stale, /clear created a new one.
-            resume_path.filter(|p| {
-                find_clear_successor(&live.pane_cwd, &matched_session_ids, p).is_none()
-            })
+            cached.or_else(|| find_jsonl_for_resumed_session(&live.tmux_session, live.pid))
         } else {
             None
         };
 
-        // Try resumed session JSONL, then /reset fallback, then New placeholder
-        let resolved_path = jsonl_path
-            .or_else(|| find_recent_unmatched_jsonl(&live.pane_cwd, &matched_session_ids));
+        let resolved_path = jsonl_path;
 
         // Mark as claimed so other sessions in the same dir don't grab the same JSONL
         if let Some(ref path) = resolved_path {
@@ -303,21 +318,24 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
             );
 
             let cwd = info.cwd.clone().unwrap_or_else(|| live.pane_cwd.clone());
-            let (project_name, branch) = git_project_info(&cwd);
+            let (project_name, relative_dir, branch) = git_project_info(&cwd);
 
             let status = determine_status(
                 &path,
                 info.input_tokens,
                 info.output_tokens,
-                Some(&live.tmux_session),
+                Some(&live.pane_target),
             );
 
+            let tags = read_tmux_tags(&live.tmux_session);
             sessions.push(Session {
                 session_id: session_id_key.clone(),
                 project_name,
+                relative_dir,
                 branch,
                 cwd,
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: info.model,
                 effort: info.effort,
                 total_input_tokens: info.input_tokens,
@@ -328,16 +346,20 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 started_at: live.started_at,
                 jsonl_path: path,
                 last_file_size: info.file_size,
+                tags,
             });
         } else {
             // No JSONL found — brand-new session, show as New placeholder
-            let (project_name, branch) = git_project_info(&live.pane_cwd);
+            let (project_name, relative_dir, branch) = git_project_info(&live.pane_cwd);
+            let tags = read_tmux_tags(&live.tmux_session);
             sessions.push(Session {
                 session_id: session_id_key.clone(),
                 project_name,
+                relative_dir,
                 branch,
                 cwd: live.pane_cwd.clone(),
                 tmux_session: Some(live.tmux_session.clone()),
+                pane_target: Some(live.pane_target.clone()),
                 model: None,
                 effort: None,
                 total_input_tokens: 0,
@@ -348,19 +370,33 @@ pub fn discover_sessions(prev_sessions: &HashMap<String, Session>) -> Vec<Sessio
                 started_at: live.started_at,
                 jsonl_path: PathBuf::new(),
                 last_file_size: 0,
+                tags,
             });
         }
     }
 
-    // Sort by last activity (most recent first), sessions with no activity last
-    sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    // Sort by last activity at minute resolution (most recent first),
+    // then by started_at as tiebreaker. Truncating to the minute prevents
+    // the table from reordering on every poll cycle.
+    sessions.sort_by(|a, b| {
+        truncate_to_minute(&b.last_activity)
+            .cmp(&truncate_to_minute(&a.last_activity))
+            .then(b.started_at.cmp(&a.started_at))
+    });
     sessions
+}
+
+/// Truncate an ISO timestamp to minute resolution for stable sorting.
+/// "2026-03-19T21:25:34.098Z" → Some("2026-03-19T21:25")
+fn truncate_to_minute(ts: &Option<String>) -> Option<String> {
+    ts.as_ref().map(|s| s.get(..16).unwrap_or(s).to_string())
 }
 
 /// Info about a live claude session, built from tmux + session files.
 struct LiveSessionInfo {
     pid: i32,
     tmux_session: String,
+    pane_target: String,
     pane_cwd: String,
     started_at: u64,
 }
@@ -375,25 +411,28 @@ fn build_live_session_map() -> HashMap<String, LiveSessionInfo> {
     let tmux_panes = discover_claude_tmux_panes();
 
     let mut map = HashMap::new();
-    for (pid, tmux_session, pane_cwd) in tmux_panes {
+    for (pid, tmux_session, pane_target, pane_cwd) in tmux_panes {
         if let Some(info) = pid_session_map.get(&pid) {
             map.insert(
                 info.session_id.clone(),
                 LiveSessionInfo {
                     pid,
                     tmux_session,
+                    pane_target,
                     pane_cwd,
                     started_at: info.started_at,
                 },
             );
         } else {
             // Tmux pane running claude but no session file yet (just started).
-            // Use the tmux session name as a placeholder key.
+            // Use pane_target (not tmux session name) as placeholder key so that
+            // two Claude panes in the same tmux session don't collide.
             map.insert(
-                format!("tmux-{tmux_session}"),
+                format!("tmux-{pane_target}"),
                 LiveSessionInfo {
                     pid,
                     tmux_session,
+                    pane_target,
                     pane_cwd,
                     started_at: 0,
                 },
@@ -419,6 +458,7 @@ use std::time::Instant;
 
 struct GitInfo {
     repo_name: String,
+    relative_dir: Option<String>,
     branch: Option<String>,
     fetched_at: Instant,
 }
@@ -427,18 +467,27 @@ static GIT_CACHE: Mutex<Option<HashMap<String, GitInfo>>> = Mutex::new(None);
 
 const GIT_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Get the git project name and branch for a directory (cached for 30s).
-fn git_project_info(cwd: &str) -> (String, Option<String>) {
+/// Get the git project name, relative_dir, and branch for a directory (cached for 30s).
+fn git_project_info(cwd: &str) -> (String, Option<String>, Option<String>) {
+    if !validate_cwd(cwd) {
+        let fallback = Path::new(cwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| cwd.to_string());
+        return (fallback, None, None);
+    }
+
     {
         let cache = GIT_CACHE.lock().unwrap();
         if let Some(info) = cache.as_ref().and_then(|c| c.get(cwd)) {
             if info.fetched_at.elapsed() < GIT_CACHE_TTL {
-                return (info.repo_name.clone(), info.branch.clone());
+                return (info.repo_name.clone(), info.relative_dir.clone(), info.branch.clone());
             }
         }
     }
 
     let repo_name = fetch_git_repo_name(cwd);
+    let relative_dir = fetch_relative_dir(cwd);
     let branch = fetch_git_branch(cwd);
 
     let mut cache = GIT_CACHE.lock().unwrap();
@@ -449,16 +498,18 @@ fn git_project_info(cwd: &str) -> (String, Option<String>) {
         cwd.to_string(),
         GitInfo {
             repo_name: repo_name.clone(),
+            relative_dir: relative_dir.clone(),
             branch: branch.clone(),
             fetched_at: Instant::now(),
         },
     );
-    (repo_name, branch)
+    (repo_name, relative_dir, branch)
 }
 
 /// Validate that a CWD path is safe to pass to external commands.
 /// Rejects paths that are not absolute or do not resolve to an existing directory.
-fn is_safe_cwd(cwd: &str) -> bool {
+/// Uses canonicalize to resolve symlinks before checking.
+pub(crate) fn validate_cwd(cwd: &str) -> bool {
     let path = Path::new(cwd);
     if !path.is_absolute() {
         return false;
@@ -470,32 +521,41 @@ fn is_safe_cwd(cwd: &str) -> bool {
 }
 
 fn fetch_git_repo_name(cwd: &str) -> String {
-    if !is_safe_cwd(cwd) {
-        return Path::new(cwd)
+    // Use --git-common-dir to get a stable name across worktrees
+    fetch_canonical_repo_name(cwd).unwrap_or_else(|| {
+        Path::new(cwd)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| cwd.to_string());
-    }
-    match std::process::Command::new("git")
-        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+            .unwrap_or_else(|| cwd.to_string())
+    })
+}
+
+/// Get the canonical repo name from --git-common-dir (stable across worktrees).
+fn fetch_canonical_repo_name(cwd: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--git-common-dir"])
         .output()
-    {
-        Ok(o) if o.status.success() => {
-            let toplevel = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            Path::new(&toplevel)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| cwd.to_string())
-        }
-        _ => Path::new(cwd)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| cwd.to_string()),
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let common = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let common_path = if Path::new(&common).is_absolute() {
+        PathBuf::from(&common)
+    } else {
+        PathBuf::from(cwd).join(&common)
+    };
+    let resolved = common_path.canonicalize().unwrap_or(common_path);
+    let repo_root = if resolved.file_name().map(|n| n == ".git").unwrap_or(false) {
+        resolved.parent()?
+    } else {
+        &resolved
+    };
+    repo_root.file_name().map(|n| n.to_string_lossy().to_string())
 }
 
 fn fetch_git_branch(cwd: &str) -> Option<String> {
-    if !is_safe_cwd(cwd) {
+    if !validate_cwd(cwd) {
         return None;
     }
     let output = std::process::Command::new("git")
@@ -510,6 +570,38 @@ fn fetch_git_branch(cwd: &str) -> Option<String> {
         None
     } else {
         Some(branch)
+    }
+}
+
+/// Compute the relative path from the git worktree root to the CWD.
+///
+/// Returns None if CWD is the worktree root (or not a git repo).
+///   /repos/line5              → None
+///   /repos/line5/tools/solo   → Some("tools/solo")
+fn fetch_relative_dir(cwd: &str) -> Option<String> {
+    let toplevel = match std::process::Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return None,
+    };
+
+    // Canonicalize both paths to resolve symlinks (e.g. /tmp → /private/tmp on macOS)
+    let cwd_resolved = Path::new(cwd)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(cwd));
+    let top_resolved = Path::new(&toplevel)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&toplevel));
+    let relative = cwd_resolved
+        .strip_prefix(&top_resolved)
+        .unwrap_or(Path::new(""));
+
+    if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        None
+    } else {
+        Some(relative.display().to_string())
     }
 }
 
@@ -654,6 +746,10 @@ fn parse_jsonl(
         }
 
         if trimmed.contains("\"type\":\"assistant\"") {
+            // Skip synthetic entries — they have 0 tokens and overwrite real data
+            if trimmed.contains("\"<synthetic>\"") {
+                continue;
+            }
             if let Ok(entry) = serde_json::from_str::<JsonlEntry>(trimmed) {
                 if let Some(ts) = entry.timestamp {
                     last_activity = Some(ts);
@@ -775,6 +871,17 @@ fn read_tmux_env(session_name: &str, var: &str) -> Option<String> {
     line.trim().split_once('=').map(|(_, v)| v.to_string())
 }
 
+/// Read RECON_TAGS from a tmux session's environment and parse into key:value pairs.
+fn read_tmux_tags(session_name: &str) -> HashMap<String, String> {
+    read_tmux_env(session_name, "RECON_TAGS")
+        .map(|val| {
+            val.split(',')
+                .filter_map(|tag| tag.split_once(':').map(|(k, v)| (k.to_string(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse `--resume <session-id>` from the process command line via ps.
 /// Fallback for sessions not created by `recon --resume`.
 fn parse_resume_id_from_ps(pid: i32) -> Option<String> {
@@ -823,125 +930,10 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
-/// Encode a CWD path to a Claude project directory name.
-/// Claude Code replaces both `/` and `.` with `-`.
-fn encode_project_path(cwd: &str) -> String {
-    cwd.replace('/', "-").replace('.', "-")
-}
-
-/// Find the newest unmatched JSONL in the project directory for `cwd` that was
-/// created by `/clear` (has the `/clear` command marker in its first few lines)
-/// and is newer than `current_jsonl`. Returns None if no such file exists.
-fn find_clear_successor(
-    cwd: &str,
-    matched_session_ids: &std::collections::HashSet<String>,
-    current_jsonl: &Path,
-) -> Option<PathBuf> {
-    let cur_mtime = current_jsonl.metadata().ok().and_then(|m| m.modified().ok())?;
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-    let project_dir = projects_dir.join(encode_project_path(cwd));
-
-    if !project_dir.is_dir() {
-        return None;
-    }
-
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            continue;
-        }
-        let session_id = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if matched_session_ids.contains(&session_id) {
-            continue;
-        }
-        let modified = match path.metadata().ok().and_then(|m| m.modified().ok()) {
-            Some(t) => t,
-            None => continue,
-        };
-        // Must be newer than the current JSONL
-        if modified <= cur_mtime {
-            continue;
-        }
-        // Check for /clear marker in first few lines
-        if !is_clear_born(&path) {
-            continue;
-        }
-        if best.as_ref().map_or(true, |(_, t)| modified > *t) {
-            best = Some((path, modified));
-        }
-    }
-    best.map(|(p, _)| p)
-}
-
-/// Check if a JSONL file was created by `/clear` by looking for the command
-/// marker in its first few lines.
-fn is_clear_born(path: &Path) -> bool {
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    for _ in 0..5 {
-        match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.contains("<command-name>/clear</command-name>") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Find the most recently modified JSONL in the project directory for `cwd`
-/// whose session ID is not already claimed by another live session.
-///
-/// This handles `/reset` (and `/clear`): Claude Code creates a new session ID
-/// and JSONL but does NOT update `{PID}.json`, so the live map points at a
-/// stale session ID with no matching JSONL file.
-fn find_recent_unmatched_jsonl(
-    cwd: &str,
-    matched_session_ids: &std::collections::HashSet<String>,
-) -> Option<PathBuf> {
-    let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-    let project_dir = projects_dir.join(encode_project_path(cwd));
-
-    if !project_dir.is_dir() {
-        return None;
-    }
-
-    let mut best: Option<(PathBuf, SystemTime)> = None;
-    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|e| e == "jsonl").unwrap_or(false) {
-            continue;
-        }
-        let session_id = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if matched_session_ids.contains(&session_id) {
-            continue;
-        }
-        let modified = match path.metadata().ok().and_then(|m| m.modified().ok()) {
-            Some(t) => t,
-            None => continue,
-        };
-        if best.as_ref().map_or(true, |(_, t)| modified > *t) {
-            best = Some((path, modified));
-        }
-    }
-    best.map(|(p, _)| p)
-}
-
 /// Resolve and validate a JSONL path for a given session ID.
 /// Validates the session ID, then scans project directories for a matching JSONL file,
 /// canonicalizes the path, and verifies it stays within the projects directory.
+/// When multiple matches exist (e.g. across worktrees), picks the largest file.
 fn resolve_session_jsonl(session_id: &str) -> Option<PathBuf> {
     if !is_valid_session_id(session_id) {
         return None;
@@ -958,6 +950,8 @@ fn resolve_session_jsonl(session_id: &str) -> Option<PathBuf> {
             return None;
         }
     };
+
+    let mut best: Option<(PathBuf, u64)> = None;
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
         let file_type = match entry.file_type() {
             Ok(t) => t,
@@ -988,10 +982,13 @@ fn resolve_session_jsonl(session_id: &str) -> Option<PathBuf> {
             .map(|e| e == "jsonl")
             .unwrap_or(false)
         {
-            return Some(canonical_candidate);
+            let size = canonical_candidate.metadata().ok().map(|m| m.len()).unwrap_or(0);
+            if best.as_ref().map_or(true, |(_, s)| size > *s) {
+                best = Some((canonical_candidate, size));
+            }
         }
     }
-    None
+    best.map(|(p, _)| p)
 }
 
 /// Return session-id → tmux info for all currently live claude sessions.
@@ -1004,20 +1001,20 @@ pub fn build_live_session_map_public() -> HashMap<String, String> {
 }
 
 /// Check if a session ID (JSONL-based) is already running in tmux.
-/// Returns the tmux session name if found.
+/// Returns the pane target (session:window.pane) if found.
 pub fn find_live_tmux_for_session(session_id: &str) -> Option<String> {
     let live_map = build_live_session_map();
 
     // Direct match: PID file's session_id == the one we're looking for.
     if let Some(info) = live_map.get(session_id) {
-        return Some(info.tmux_session.clone());
+        return Some(info.pane_target.clone());
     }
 
     // Resumed session: RECON_RESUMED_FROM env var matches.
     for (_, info) in &live_map {
         if let Some(orig_id) = read_tmux_env(&info.tmux_session, "RECON_RESUMED_FROM") {
             if orig_id == session_id {
-                return Some(info.tmux_session.clone());
+                return Some(info.pane_target.clone());
             }
         }
     }
@@ -1052,33 +1049,36 @@ pub fn find_session_cwd(session_id: &str) -> Option<String> {
 }
 
 /// Determine session status from token counts and tmux pane content.
-/// - New: no tokens yet (input and output both zero)
+/// - New: no tokens yet and pane looks idle
 /// - Otherwise: delegates to pane_status() to inspect the Claude Code TUI status bar
-fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, tmux_session: Option<&str>) -> SessionStatus {
-    if input_tokens == 0 && output_tokens == 0 {
-        return SessionStatus::New;
+fn determine_status(_path: &Path, input_tokens: u64, output_tokens: u64, pane_target: Option<&str>) -> SessionStatus {
+    // tmux pane content is the source of truth for active sessions
+    if let Some(target) = pane_target {
+        let pane = pane_status(target);
+        // Only show New if pane also looks idle (no active streaming)
+        if input_tokens == 0 && output_tokens == 0 && pane == SessionStatus::Idle {
+            return SessionStatus::New;
+        }
+        return pane;
     }
 
-    // tmux pane content is the source of truth
-    if let Some(name) = tmux_session {
-        pane_status(name)
+    if input_tokens == 0 && output_tokens == 0 {
+        SessionStatus::New
     } else {
         SessionStatus::Idle
     }
 }
 
-/// Determine status by inspecting the Claude Code TUI status bar.
+/// Determine status by inspecting the Claude Code TUI pane content.
 ///
-/// The last non-empty line in the pane is typically the status bar:
-///   "esc to interrupt"  → agent is streaming or running a tool
-///   "Esc to cancel"     → permission prompt waiting for user input
-///
-/// Some permission prompts use a selection menu instead of "Esc to cancel"
-/// (e.g. fetch permissions). We scan a few lines back to detect those via
-/// the "❯ N." selection arrow pattern (e.g. "❯ 2. Yes, and don't ask again").
-fn pane_status(session_name: &str) -> SessionStatus {
+/// Scans the last few non-empty lines bottom-up looking for:
+///   - Working: a line starting with a Unicode spinner (✽✢✳✶⏺) that also
+///     contains "…" — these are thinking/tool-execution progress indicators
+///   - Input: "Esc to cancel" on the last line, or a selection menu ("❯ N.")
+///   - Idle: anything else
+fn pane_status(pane_target: &str) -> SessionStatus {
     let output = match std::process::Command::new("tmux")
-        .args(["capture-pane", "-t", session_name, "-p"])
+        .args(["capture-pane", "-t", pane_target, "-p"])
         .output()
     {
         Ok(o) if o.status.success() => o,
@@ -1094,33 +1094,45 @@ fn pane_status(session_name: &str) -> SessionStatus {
             continue;
         }
 
-        // Status bar is always the very last non-empty line
-        if lines_checked == 0 {
-            if trimmed.contains("esc to interrupt") {
+        // Input: permission prompt on the very last non-empty line
+        if lines_checked == 0 && trimmed.contains("Esc to cancel") {
+            return SessionStatus::Input;
+        }
+
+        // Working: line starts with a spinner character and contains "…"
+        // Spinners: ✽(U+273D) ✢(U+2722) ✳(U+2733) ✶(U+2736) ⏺(U+23FA)
+        if let Some(first) = trimmed.chars().next() {
+            if is_spinner(first) && trimmed.contains('\u{2026}') {
                 return SessionStatus::Working;
-            }
-            if trimmed.contains("Esc to cancel") {
-                return SessionStatus::Input;
             }
         }
 
-        // Selection-style permission prompts show "❯ N." (arrow + digit)
-        // e.g. " ❯ 2. Yes, and don't ask again for docs.asciinema.org"
-        // This is distinct from the regular prompt "❯ user text".
-        if let Some(pos) = trimmed.find('❯') {
-            let after = trimmed[pos + '❯'.len_utf8()..].trim_start();
+        // Input: selection-style permission prompts ("❯ N.")
+        if let Some(pos) = trimmed.find('\u{276F}') { // ❯
+            let after = trimmed[pos + '\u{276F}'.len_utf8()..].trim_start();
             if after.starts_with(|c: char| c.is_ascii_digit()) {
                 return SessionStatus::Input;
             }
         }
 
         lines_checked += 1;
-        if lines_checked >= 5 {
+        if lines_checked >= 10 {
             break;
         }
     }
 
     SessionStatus::Idle
+}
+
+/// Check if a character is a Claude Code activity indicator.
+/// Covers dingbat spinners (✽✢✳✶✻ etc.), record symbol (⏺),
+/// and middle dot (·) used for progress lines.
+fn is_spinner(c: char) -> bool {
+    matches!(c,
+        '\u{2720}'..='\u{2767}' | // Dingbats: ✽✢✳✶✻✺✴✵ etc.
+        '\u{23FA}'              | // ⏺ (record)
+        '\u{00B7}'                // · (middle dot, used for progress)
+    )
 }
 
 // --- Live session discovery ---
@@ -1173,13 +1185,13 @@ fn read_pid_session_map() -> HashMap<i32, SessionFileInfo> {
 
 /// Get tmux panes running claude.
 /// Returns Vec<(pid, session_name, pane_cwd)>.
-fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
+fn discover_claude_tmux_panes() -> Vec<(i32, String, String, String)> {
     let output = match std::process::Command::new("tmux")
         .args([
             "list-panes",
             "-a",
             "-F",
-            "#{pane_pid}|||#{session_name}|||#{pane_current_command}|||#{pane_current_path}",
+            "#{pane_pid}|||#{session_name}|||#{pane_current_command}|||#{pane_current_path}|||#{window_index}|||#{pane_index}",
         ])
         .output()
     {
@@ -1194,8 +1206,8 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
         .unwrap_or_default();
 
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(4, "|||").collect();
-        if parts.len() < 4 {
+        let parts: Vec<&str> = line.splitn(6, "|||").collect();
+        if parts.len() < 6 {
             continue;
         }
         let pid: i32 = match parts[0].parse() {
@@ -1205,6 +1217,8 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
         let session_name = parts[1];
         let command = parts[2];
         let pane_path = parts[3];
+        let window_index = parts[4];
+        let pane_index = parts[5];
 
         // Claude shows up as a version number (e.g. "2.1.76") or "claude" or "node"
         let is_claude = command
@@ -1225,11 +1239,13 @@ fn discover_claude_tmux_panes() -> Vec<(i32, String, String)> {
                 find_claude_child_pid(pid)
             };
             if let Some(cpid) = claude_pid {
-                results.push((cpid, session_name.to_string(), pane_path.to_string()));
+                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
+                results.push((cpid, session_name.to_string(), pane_target, pane_path.to_string()));
             }
         } else if command == "bash" || command == "sh" || command == "zsh" {
             if let Some(claude_pid) = find_claude_child_pid(pid) {
-                results.push((claude_pid, session_name.to_string(), pane_path.to_string()));
+                let pane_target = format!("{session_name}:{window_index}.{pane_index}");
+                results.push((claude_pid, session_name.to_string(), pane_target, pane_path.to_string()));
             }
         }
     }
@@ -1256,29 +1272,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_safe_cwd_rejects_relative_paths() {
-        assert!(!is_safe_cwd("relative/path"));
-        assert!(!is_safe_cwd("./here"));
-        assert!(!is_safe_cwd("../parent"));
+    fn validate_cwd_rejects_relative_paths() {
+        assert!(!validate_cwd("relative/path"));
+        assert!(!validate_cwd("./here"));
+        assert!(!validate_cwd("../parent"));
     }
 
     #[test]
-    fn is_safe_cwd_rejects_nonexistent_absolute_paths() {
-        assert!(!is_safe_cwd("/nonexistent/path/that/does/not/exist/xyz123"));
+    fn validate_cwd_rejects_nonexistent_absolute_paths() {
+        assert!(!validate_cwd("/nonexistent/path/that/does/not/exist/xyz123"));
     }
 
     #[test]
-    fn is_safe_cwd_accepts_real_directories() {
-        assert!(is_safe_cwd("/tmp"));
-        // Home directory should always exist
+    fn validate_cwd_accepts_real_directories() {
+        assert!(validate_cwd("/tmp"));
         if let Some(home) = dirs::home_dir() {
-            assert!(is_safe_cwd(&home.to_string_lossy()));
+            assert!(validate_cwd(&home.to_string_lossy()));
         }
     }
 
     #[test]
     fn fetch_git_repo_name_handles_nonexistent_cwd() {
-        // Should return the basename, not panic or invoke git
         let result = fetch_git_repo_name("/nonexistent/path/my-project");
         assert_eq!(result, "my-project");
     }

@@ -21,7 +21,7 @@ Creatures are rendered as colored pixel art using half-block characters. Working
 | **Idle** | Sleeping blob with Zzz | Blue-grey |
 | **New** | Egg with spots | Cream |
 
-- **Rooms** group agents by working directory (2×2 grid, paginated)
+- **Rooms** group agents by git repository — worktrees of the same repo share a room, while monorepo sub-projects get their own (e.g. `myapp` vs `myapp › tools/cli`) (2×2 grid, paginated)
 - **Zoom** into a room with `1`-`4`, page with `j`/`k`
 - **Context bar** per agent with green/yellow/red coloring
 
@@ -37,7 +37,7 @@ Creatures are rendered as colored pixel art using half-block characters. Working
 │  5  scratch          recon::main            ~/repos/recon      ● Idle  Opus 4.6    3k/1M    10m ago     │
 │  6  new-session      dotfiles::main         ~/repos/dotfiles   ● New   —           —        —           │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k navigate  Enter switch  v view  r refresh  q quit
+j/k navigate  Enter switch  / search  v view  q quit
 ```
 
 - **Input** rows are highlighted — these sessions are blocked waiting for your approval
@@ -101,8 +101,11 @@ Requires tmux and [Claude Code](https://claude.ai/claude-code).
 recon                                        # Table dashboard
 recon view                                   # Tamagotchi visual dashboard
 recon json                                   # JSON output (for scripting)
-recon launch                                 # Create a new claude session in the current directory
-recon launch --name-only                     # Print session name without attaching
+recon launch                                 # Create a new claude session (background)
+recon launch --name foo --cwd ~/repos/myapp  # Custom name and directory
+recon launch --command "claude --model sonnet" --attach  # Custom command, attach to session
+recon launch --tag env:staging --tag role:reviewer       # Tag a session (key:value metadata)
+recon json --tag role:reviewer               # Filter JSON output by tag (must match all)
 recon new                                    # Interactive new session form
 recon resume                                 # Interactive resume picker
 recon resume --id <session-id>               # Resume a specific session
@@ -118,17 +121,18 @@ recon unpark                                 # Restore previously parked session
 |---|---|
 | `j` / `k` | Navigate sessions |
 | `Enter` | Switch to selected tmux session |
+| `/` | Search / filter sessions by name |
 | `i` / `Tab` | Jump to next agent waiting for input |
 | `x` | Kill selected session |
 | `v` | Switch to Tamagotchi view |
-| `r` | Force refresh |
-| `q` / `Esc` | Quit |
+| `q` / `Esc` | Quit (Esc clears filter first) |
 
 ### Keybindings — Tamagotchi View
 
 | Key | Action |
 |---|---|
 | `1`-`4` | Zoom into room |
+| `/` | Search / filter sessions by name |
 | `j` / `k` | Previous / next page |
 | `h` / `l` | Select agent (when zoomed) |
 | `Enter` | Switch to selected agent (when zoomed) |
@@ -136,7 +140,6 @@ recon unpark                                 # Restore previously parked session
 | `n` | New session in room (when zoomed) |
 | `Esc` | Zoom out (or quit) |
 | `v` | Switch to table view |
-| `r` | Force refresh |
 | `q` | Quit |
 
 ## tmux config
@@ -153,6 +156,10 @@ bind X confirm-before -p "Kill session #S? (y/n)" kill-session
 ```
 
 This lets you pop open the dashboard from any tmux session, pick a session with `Enter`, and jump straight to it.
+
+## Known Limitations
+
+- **`/clear` resets session tracking** — Claude Code's `/clear` command creates a new JSONL file without updating the session-to-process mapping. After `/clear`, recon may show stale data (old tokens, old timestamps) until the session is restarted. Workaround: kill the session in recon and create a new one.
 
 ## Contribution Policy
 

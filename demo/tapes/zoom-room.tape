@@ -18,13 +18,11 @@ Sleep 2s
 Type "v"
 Sleep 2s
 
-# Zoom into room 1 (api-server with 3 agents)
+# Zoom into room 1 (api-server with 2 agents)
 Type "1"
 Sleep 3s
 
 # Navigate between agents
-Type "l"
-Sleep 800ms
 Type "l"
 Sleep 800ms
 Type "h"

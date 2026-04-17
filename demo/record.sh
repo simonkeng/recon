@@ -4,7 +4,7 @@
 #
 # Usage: ./demo/record.sh
 #
-# Outputs: demo/out/tmux-demo.gif
+# Outputs: assets/demo.gif (README hero image)
 #
 set -euo pipefail
 
@@ -15,8 +15,8 @@ echo "=== Building Docker image (compiles recon inside container) ==="
 docker build -t recon-demo -f "$SCRIPT_DIR/Dockerfile" "$REPO_DIR"
 
 echo "=== Recording demo ==="
-mkdir -p "$SCRIPT_DIR/out"
-docker run --rm --entrypoint bash -v "$SCRIPT_DIR/out:/output" recon-demo -c '
+mkdir -p "$REPO_DIR/assets"
+docker run --rm --entrypoint bash -v "$REPO_DIR/assets:/output" recon-demo -c '
     # Ensure claude dirs exist
     mkdir -p /root/.claude/sessions /root/.claude/projects
 
@@ -26,14 +26,14 @@ docker run --rm --entrypoint bash -v "$SCRIPT_DIR/out:/output" recon-demo -c '
     sleep 3
 
     # Record
-    cd /demo && vhs tapes/tmux-demo.tape
+    cd /demo && vhs tapes/readme.tape
 
     # Copy output
-    cp /demo/tmux-demo.gif /output/ 2>/dev/null || true
+    cp /demo/readme.gif /output/demo.gif 2>/dev/null || true
 
     # Cleanup
     kill $DEMO_PID 2>/dev/null || true
 '
 
 echo "=== Done ==="
-echo "Output: $SCRIPT_DIR/out/tmux-demo.gif"
+echo "Output: $REPO_DIR/assets/demo.gif"

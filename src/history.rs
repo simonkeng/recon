@@ -306,43 +306,46 @@ struct JsonlSummary {
 }
 
 /// Read model, branch, and total tokens from the last assistant entry in a JSONL file.
-/// Uses a buffered reader and reads only the last portion of the file to avoid
-/// loading potentially large JSONL files entirely into memory.
+/// Seeks to the tail of large files to avoid reading the entire file into memory.
 fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
     use std::io::{BufReader, Seek, SeekFrom};
 
+    let empty = JsonlSummary { model: None, branch: None, tokens: 0 };
     let file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return JsonlSummary { model: None, branch: None, tokens: 0 },
+        Err(_) => return empty,
     };
-
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-    // Read at most the last 512KB — enough to find recent entries without
-    // loading multi-MB session files.
-    const TAIL_SIZE: u64 = 512 * 1024;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let mut reader = BufReader::new(file);
-    let seek_pos = file_len.saturating_sub(TAIL_SIZE);
-    if seek_pos > 0 {
-        if reader.seek(SeekFrom::Start(seek_pos)).is_err() {
-            return JsonlSummary { model: None, branch: None, tokens: 0 };
+
+    // Only read the last 1MB — we only need the last ~50 lines.
+    const TAIL_BYTES: u64 = 1024 * 1024;
+    if size > TAIL_BYTES {
+        if reader.seek(SeekFrom::Start(size - TAIL_BYTES)).is_err() {
+            return empty;
         }
-        // Discard partial first line after seeking
+        // Discard partial first line after seek
         let mut discard = String::new();
         let _ = read_line_capped(&mut reader, &mut discard, MAX_LINE_LEN);
     }
 
-    // Collect the tail lines so we can iterate in reverse
-    let mut tail_lines: Vec<String> = Vec::new();
+    // Heuristic: scan the last N lines for model/branch/tokens.
+    // In practice the last assistant entry is near the end of the file.
+    const TAIL_LINES: usize = 50;
+    let mut ring = std::collections::VecDeque::with_capacity(TAIL_LINES);
     let mut line = String::new();
     loop {
         match read_line_capped(&mut reader, &mut line, MAX_LINE_LEN) {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(_) => {
+                if !line.trim().is_empty() {
+                    if ring.len() == TAIL_LINES {
+                        ring.pop_front();
+                    }
+                    ring.push_back(std::mem::take(&mut line));
+                }
+            }
             Err(_) => break,
-        }
-        if !line.is_empty() {
-            tail_lines.push(line.clone());
         }
     }
 
@@ -351,7 +354,7 @@ fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
 
-    for line in tail_lines.iter().rev().take(50) {
+    for line in ring.iter().rev() {
         // Pick up gitBranch from any recent entry
         if branch.is_none() && line.contains("\"gitBranch\"") {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
@@ -368,8 +371,8 @@ fn read_jsonl_summary(path: &std::path::Path) -> JsonlSummary {
                     if input_tokens == 0 {
                         if let Some(usage) = msg.get("usage") {
                             input_tokens = usage.get("input_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
-                                + usage.get("cache_creation_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0)
-                                + usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
+                                .saturating_add(usage.get("cache_creation_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0))
+                                .saturating_add(usage.get("cache_read_input_tokens").and_then(|t| t.as_u64()).unwrap_or(0));
                             output_tokens = usage.get("output_tokens").and_then(|t| t.as_u64()).unwrap_or(0);
                         }
                     }

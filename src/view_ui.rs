@@ -255,14 +255,15 @@ struct Room {
     last_activity: Option<String>,
 }
 
-fn group_into_rooms(sessions: &[Session]) -> Vec<Room> {
+fn group_into_rooms(sessions: &[Session], indices: &[usize]) -> Vec<Room> {
     let mut map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
 
-    for (i, s) in sessions.iter().enumerate() {
-        let room_name = if s.cwd.is_empty() {
+    for &i in indices {
+        let s = &sessions[i];
+        let room_name = if s.project_name.is_empty() {
             "unknown".to_string()
         } else {
-            shorten_home(&s.cwd)
+            s.room_id()
         };
         map.entry(room_name).or_default().push(i);
     }
@@ -348,7 +349,8 @@ fn context_bar(ratio: f64) -> (String, Color) {
 // ── Public render entry point ────────────────────────────────────────
 
 pub fn resolve_zoom(app: &mut App) {
-    let rooms = group_into_rooms(&app.sessions);
+    let filtered = app.filtered_indices();
+    let rooms = group_into_rooms(&app.sessions, &filtered);
     let total_pages = (rooms.len() + ROOMS_PER_PAGE - 1) / ROOMS_PER_PAGE;
     if total_pages > 0 {
         app.view_page = app.view_page.min(total_pages - 1);
@@ -377,15 +379,50 @@ pub fn resolve_zoom(app: &mut App) {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
-    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
+    let show_search = app.filter_active || !app.filter_text.is_empty();
+    let chunks = if show_search {
+        Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(frame.area())
+    } else {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area())
+    };
 
     render_rooms(frame, app, chunks[0]);
-    render_footer(frame, app, chunks[1]);
+    if show_search {
+        render_search_bar(frame, app, chunks[1]);
+        render_footer(frame, app, chunks[2]);
+    } else {
+        render_footer(frame, app, chunks[1]);
+    }
+}
+
+fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans = vec![
+        Span::styled("/", Style::default().fg(Color::Cyan)),
+        Span::raw(&app.filter_text),
+    ];
+    if !app.filter_active && !app.filter_text.is_empty() {
+        let count = app.filtered_indices().len();
+        spans.push(Span::styled(
+            format!("  ({} match{})", count, if count == 1 { "" } else { "es" }),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let paragraph = Paragraph::new(Line::from(spans));
+    frame.render_widget(paragraph, area);
+
+    if app.filter_active {
+        frame.set_cursor_position((area.x + 1 + app.filter_cursor as u16, area.y));
+    }
 }
 
 fn render_rooms(frame: &mut Frame, app: &App, area: Rect) {
-    let rooms = group_into_rooms(&app.sessions);
+    let rooms = group_into_rooms(&app.sessions, &app.filtered_indices());
 
     if rooms.is_empty() {
         render_empty(frame, area, app.tick);
@@ -578,7 +615,7 @@ fn render_empty(frame: &mut Frame, area: Rect, _tick: u64) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let rooms = group_into_rooms(&app.sessions);
+    let rooms = group_into_rooms(&app.sessions, &app.filtered_indices());
     let total_pages = (rooms.len() + ROOMS_PER_PAGE - 1) / ROOMS_PER_PAGE;
     let page = app.view_page.min(total_pages.saturating_sub(1));
 
@@ -604,12 +641,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    spans.push(Span::styled("/", Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw(" search  "));
     spans.push(Span::styled("i", Style::default().fg(Color::Cyan)));
     spans.push(Span::raw(" next input  "));
     spans.push(Span::styled("v", Style::default().fg(Color::Cyan)));
     spans.push(Span::raw(" table  "));
-    spans.push(Span::styled("r", Style::default().fg(Color::Cyan)));
-    spans.push(Span::raw(" refresh  "));
     spans.push(Span::styled("q", Style::default().fg(Color::Cyan)));
     spans.push(Span::raw(" quit"));
 
@@ -618,16 +655,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-fn shorten_home(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home_str.as_ref()) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_string()
-}
 
 fn truncate_str(s: &str, max_width: usize) -> String {
     let char_count: usize = s.chars().count();
@@ -649,10 +676,12 @@ mod tests {
     fn make_session(cwd: &str, status: SessionStatus, last_activity: Option<&str>) -> Session {
         Session {
             session_id: String::new(),
-            project_name: String::new(),
+            project_name: cwd.to_string(),
             branch: None,
             cwd: cwd.to_string(),
+            relative_dir: None,
             tmux_session: None,
+            pane_target: None,
             model: None,
             effort: None,
             total_input_tokens: 0,
@@ -663,6 +692,7 @@ mod tests {
             started_at: 0,
             jsonl_path: PathBuf::new(),
             last_file_size: 0,
+            tags: std::collections::HashMap::new(),
         }
     }
 
@@ -672,7 +702,8 @@ mod tests {
             make_session("/a", SessionStatus::Idle, Some("2026-03-16T10:00:00Z")),
             make_session("/b", SessionStatus::Input, Some("2026-03-16T09:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/b");
         assert_eq!(rooms[1].name, "/a");
     }
@@ -684,7 +715,8 @@ mod tests {
             make_session("/recent", SessionStatus::Idle, Some("2026-03-16T12:00:00Z")),
             make_session("/mid", SessionStatus::Idle, Some("2026-03-16T10:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/recent");
         assert_eq!(rooms[1].name, "/mid");
         assert_eq!(rooms[2].name, "/old");
@@ -696,7 +728,8 @@ mod tests {
             make_session("/egg", SessionStatus::New, None),
             make_session("/active", SessionStatus::Idle, Some("2026-03-16T10:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/active");
         assert_eq!(rooms[1].name, "/egg");
     }
@@ -709,7 +742,8 @@ mod tests {
             make_session("/repo", SessionStatus::Idle, Some("2026-03-16T12:00:00Z")),
             make_session("/other", SessionStatus::Idle, Some("2026-03-16T10:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/repo");
         assert_eq!(rooms[1].name, "/other");
     }
@@ -720,9 +754,39 @@ mod tests {
             make_session("/old-input", SessionStatus::Input, Some("2026-03-16T08:00:00Z")),
             make_session("/new-input", SessionStatus::Input, Some("2026-03-16T12:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/new-input");
         assert_eq!(rooms[1].name, "/old-input");
+    }
+
+    #[test]
+    fn worktrees_share_room_by_project_name() {
+        // Two sessions with different CWDs but same project_name should be in the same room
+        let mut s1 = make_session("/repos/line5", SessionStatus::Idle, Some("2026-03-16T10:00:00Z"));
+        s1.project_name = "line5".to_string();
+        let mut s2 = make_session("/worktrees/line5-feat", SessionStatus::Working, Some("2026-03-16T11:00:00Z"));
+        s2.project_name = "line5".to_string();
+        let sessions = [s1, s2];
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
+        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms[0].name, "line5");
+        assert_eq!(rooms[0].session_indices.len(), 2);
+    }
+
+    #[test]
+    fn subproject_gets_separate_room() {
+        // Root and subproject should be different rooms
+        let mut s1 = make_session("/repos/line5", SessionStatus::Idle, Some("2026-03-16T10:00:00Z"));
+        s1.project_name = "line5".to_string();
+        let mut s2 = make_session("/repos/line5/tools/solo", SessionStatus::Idle, Some("2026-03-16T11:00:00Z"));
+        s2.project_name = "line5".to_string();
+        s2.relative_dir = Some("tools/solo".to_string());
+        let sessions = [s1, s2];
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
+        assert_eq!(rooms.len(), 2);
     }
 
     #[test]
@@ -733,7 +797,8 @@ mod tests {
             make_session("/egg", SessionStatus::New, None),
             make_session("/idle-old", SessionStatus::Idle, Some("2026-03-16T09:00:00Z")),
         ];
-        let rooms = group_into_rooms(&sessions);
+        let all: Vec<usize> = (0..sessions.len()).collect();
+        let rooms = group_into_rooms(&sessions, &all);
         assert_eq!(rooms[0].name, "/input-old");   // input first regardless of activity
         assert_eq!(rooms[1].name, "/idle-recent");  // most recent activity
         assert_eq!(rooms[2].name, "/idle-old");     // older activity
